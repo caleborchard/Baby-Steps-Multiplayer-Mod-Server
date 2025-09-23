@@ -6,6 +6,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Numerics;
 using System.Text;
+using static System.Runtime.InteropServices.JavaScript.JSType;
 
 namespace BabyStepsServer
 {
@@ -15,12 +16,13 @@ namespace BabyStepsServer
         public required byte _uuid;
         public string? _displayName;
         public Color? _color;
+        public bool collisionsEnabled = true;
+        public bool jiminyState = false;
         public byte _lbKickoffPoint = 0;
         public byte[]? _latestRawBonePacket;
         public Vector3 position;
         public List<NetPeer>? distantClients;
-        public byte[]? _latestAccessoryHatPacket;
-        public byte[]? _latestAccessoryHIPacket;
+        public Dictionary<byte, byte[]?> _savedPackets = new();
     }
     class Program : INetEventListener
     {
@@ -33,6 +35,8 @@ namespace BabyStepsServer
         private const byte OPCODE_GWE = 0x06; // Generic World Event (Particles and sound effects)
         private const byte OPCODE_AAE = 0x07; // Accessory Add Event
         private const byte OPCODE_ARE = 0x08; // Accessory Remove Event
+        private const byte OPCODE_JRE = 0x09; // Jiminy Ribbon Event
+        private const byte OPCODE_CTE = 0xA; // Collision Toggle Event
 
         // --- Fields ---
         private NetManager _server;
@@ -52,6 +56,10 @@ namespace BabyStepsServer
         private volatile bool _isCulling = false;
         private readonly object _clientLock = new object();
 
+        private string configPath = "settings.cfg";
+        private string password = "cuzzillobochfoddy";
+        private int port = 7777;
+
         // --- Entry Point ---
         static void Main(string[] args)
         {
@@ -59,6 +67,46 @@ namespace BabyStepsServer
         }
         public Program()
         {
+            if (File.Exists(configPath))
+            {
+                foreach (var line in File.ReadAllLines(configPath))
+                {
+                    if (line.StartsWith("port="))
+                    {
+                        if (int.TryParse(line.Substring("port=".Length), out int parsedPort))
+                        {
+                            if (parsedPort > 0 && parsedPort < 65535)
+                            {
+                                port = parsedPort;
+                            }
+                            else
+                            {
+                                Console.WriteLine("Invalid port in config!");
+                                Environment.Exit(0);
+                            }
+                        }
+                    }
+                    else if (line.StartsWith("password="))
+                    {
+                        string parsedPwd = line.Substring("password=".Length);
+                        if (parsedPwd.Length > 0)
+                        {
+                            password = parsedPwd;
+                        }
+                    }
+                }
+            }
+            else
+            {
+                string[] lines =
+                {
+                    "port=7777",
+                    "password="
+                };
+                File.WriteAllLines(configPath, lines);
+                Console.WriteLine("No settings.cfg file found, creating default one");
+            }
+
             _server = new NetManager(this)
             {
                 AutoRecycle = true,
@@ -68,8 +116,10 @@ namespace BabyStepsServer
         }
         public void Run()
         {
-            _server.Start(7777);
-            Console.WriteLine($"Server started on UDP port {_server.LocalPort}");
+            _server.Start(port);
+            Console.WriteLine($"Server started on UDP port {port} " + 
+                (password == "cuzzillobochfoddy" ? "with no password" : $"with password {password}")
+                );
 
             Stopwatch sw = new Stopwatch();
             sw.Start();
@@ -144,11 +194,13 @@ namespace BabyStepsServer
                 var infoPacket = GetClientInfoPacket(client.Key);
                 if (infoPacket != null) Send(peer, infoPacket, DeliveryMethod.ReliableOrdered);
 
-                var hatPacket = client.Value._latestAccessoryHatPacket;
-                if (hatPacket != null) Send(peer, hatPacket, DeliveryMethod.ReliableOrdered);
-
-                var hIPacket = client.Value._latestAccessoryHIPacket;
-                if (hIPacket != null) Send(peer, hIPacket, DeliveryMethod.ReliableOrdered);
+                foreach (var savedPacket in client.Value._savedPackets)
+                {
+                    if (savedPacket.Value != null)
+                    {
+                        Send(peer, savedPacket.Value, DeliveryMethod.ReliableOrdered);
+                    }
+                }
             }
         }
         public void OnPeerDisconnected(NetPeer peer, DisconnectInfo disconnectInfo)
@@ -193,7 +245,14 @@ namespace BabyStepsServer
         }
         public void OnConnectionRequest(ConnectionRequest request)
         {
-            request.AcceptIfKey("cuzzillobochfoddy");
+            string incomingKey = request.Data.GetString();
+
+            if (incomingKey == password) request.Accept();
+            else
+            {
+                request.Reject();
+                Console.WriteLine($"Client tried to connect with incorrect password");
+            }
         }
         public void OnNetworkReceiveUnconnected(IPEndPoint endPoint, NetPacketReader reader, UnconnectedMessageType messageType) { }
         public void OnNetworkError(IPEndPoint endPoint, SocketError socketError)
@@ -248,6 +307,8 @@ namespace BabyStepsServer
                 case 3: HandleWorldEvent(peer, client, data); break;
                 case 4: HandleAccessoryAdd(peer, client, data); break;
                 case 5: HandleAccessoryRemove(peer, client, data); break;
+                case 6: HandleJiminyUpdate(peer, client, data); break;
+                case 7: HandleCollisionToggleUpdate(peer, client, data); break;
                 default: Console.WriteLine($"{client._uuid}: Unknown opcode {opcode}"); break;
             }
         }
@@ -306,12 +367,7 @@ namespace BabyStepsServer
             packet.AddRange(data[1..]);
             var packetArray = packet.ToArray();
 
-            switch (data[1])
-            {
-                case 0x00: client._latestAccessoryHatPacket = packetArray; break;
-                case 0x01: client._latestAccessoryHIPacket = packetArray; break;
-                default: break;
-            }
+            client._savedPackets[data[1]] = packetArray;
 
             Broadcast(packetArray, DeliveryMethod.ReliableOrdered, exclude: peer);
         }
@@ -320,14 +376,30 @@ namespace BabyStepsServer
             List<byte> packet = new() { OPCODE_ARE, client._uuid };
             packet.AddRange(data[1..]);
 
-            switch (packet[1])
-            {
-                case 0x00: client._latestAccessoryHatPacket = null; break;
-                case 0x01: client._latestAccessoryHIPacket = null; break;
-                default: break;
-            }
+            client._savedPackets[data[1]] = null;
 
             Broadcast(packet.ToArray(), DeliveryMethod.ReliableOrdered, exclude: peer);
+        }
+        private void HandleJiminyUpdate(NetPeer peer, ClientInfo client, byte[] data)
+        {
+            client.jiminyState = Convert.ToBoolean(data[1]);
+
+            byte[] packet = { OPCODE_JRE, client._uuid, Convert.ToByte(client.jiminyState) };
+
+            client._savedPackets[0x02] = packet;
+
+            Broadcast(packet, DeliveryMethod.ReliableOrdered, exclude: peer);
+        }
+
+        private void HandleCollisionToggleUpdate(NetPeer peer, ClientInfo client, byte[] data)
+        {
+            client.collisionsEnabled = Convert.ToBoolean(data[1]);
+
+            byte[] packet = { OPCODE_CTE, client._uuid, Convert.ToByte(client.collisionsEnabled) };
+
+            client._savedPackets[0x03] = packet;
+
+            Broadcast(packet, DeliveryMethod.ReliableOrdered, exclude: peer);
         }
 
         // --- UUID Management ---
