@@ -59,6 +59,7 @@ namespace BabyStepsServer
         private string configPath = "settings.cfg";
         private string password = "cuzzillobochfoddy";
         private int port = 7777;
+        private int distanceCutoff = 100;
 
         // --- Entry Point ---
         static void Main(string[] args)
@@ -94,6 +95,21 @@ namespace BabyStepsServer
                             password = parsedPwd;
                         }
                     }
+                    else if (line.StartsWith("player_transmit_cutoff="))
+                    {
+                        if (int.TryParse(line.Substring("player_transmit_cutoff=".Length), out int transmitCutoff))
+                        {
+                            if (transmitCutoff > 0)
+                            {
+                                distanceCutoff = transmitCutoff;
+                            }
+                            else
+                            {
+                                Console.WriteLine("Player Transmit Cutoff value invalid");
+                                Environment.Exit(0);
+                            }
+                        }
+                    }
                 }
             }
             else
@@ -101,7 +117,8 @@ namespace BabyStepsServer
                 string[] lines =
                 {
                     "port=7777",
-                    "password="
+                    "password=",
+                    "player_transmit_cutoff=100"
                 };
                 File.WriteAllLines(configPath, lines);
                 Console.WriteLine("No settings.cfg file found, creating default one");
@@ -291,7 +308,7 @@ namespace BabyStepsServer
                         if (kvpA.Key == kvpB.Key) continue;
                         var clientB = kvpB.Value;
                         float distance = Vector3.Distance(posA, clientB.position);
-                        if (distance > 100f)
+                        if (distance > distanceCutoff)
                             clientA.distantClients.Add(kvpB.Key);
                     }
                 }
