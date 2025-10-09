@@ -1,4 +1,5 @@
-﻿using LiteNetLib;
+﻿using BabyStepsMultiplayerServer;
+using LiteNetLib;
 using LiteNetLib.Utils;
 using System.Diagnostics;
 using System.Drawing;
@@ -6,7 +7,6 @@ using System.Net;
 using System.Net.Sockets;
 using System.Numerics;
 using System.Text;
-using static System.Runtime.InteropServices.JavaScript.JSType;
 
 namespace BabyStepsServer
 {
@@ -22,6 +22,7 @@ namespace BabyStepsServer
         public byte[]? _latestRawBonePacket;
         public Vector3 position;
         public List<NetPeer>? distantClients;
+        public Dictionary<NetPeer, long> lastTransmitTimes = new();
         public Dictionary<byte, byte[]?> _savedPackets = new();
     }
     class Program : INetEventListener
@@ -37,6 +38,9 @@ namespace BabyStepsServer
         private const byte OPCODE_ARE = 0x08; // Accessory Remove Event
         private const byte OPCODE_JRE = 0x09; // Jiminy Ribbon Event
         private const byte OPCODE_CTE = 0xA; // Collision Toggle Event
+        private const byte OPCODE_CMS = 0xB; // Chat Message Send
+
+        private const string SERVER_VERSION = "103";
 
         // --- Fields ---
         private NetManager _server;
@@ -50,8 +54,11 @@ namespace BabyStepsServer
 
         private float throttleUnits = 3f;
         private readonly int targetFPS = 60;
+
+        private float distantUpdateMultiplier = 0.05f;
+
         private readonly Queue<(NetPeer from, byte[] data)> boneBroadcastQueue = new();
-        private float boneVectorUpdateInterval = 5000f;
+        private float staticUpdateRate = 5000f;
 
         private volatile bool _isCulling = false;
         private readonly object _clientLock = new object();
@@ -59,11 +66,13 @@ namespace BabyStepsServer
         private string configPath = "settings.cfg";
         private string password = "cuzzillobochfoddy";
         private int port = 7777;
-        private int distanceCutoff = 100;
+        private int distanceCutoff = 5;
+        private int outerDistanceCutoff = 100;
 
         // --- Entry Point ---
         static void Main(string[] args)
         {
+            Console.SetOut(new TimestampedTextWriter(Console.Out));
             new Program().Run();
         }
         public Program()
@@ -105,7 +114,37 @@ namespace BabyStepsServer
                             }
                             else
                             {
-                                Console.WriteLine("Player Transmit Cutoff value invalid");
+                                Console.WriteLine("Invalid Player Transmit Cutoff value");
+                                Environment.Exit(0);
+                            }
+                        }
+                    }
+                    else if (line.StartsWith("outer_player_transmit_cutoff="))
+                    {
+                        if (int.TryParse(line.Substring("outer_player_transmit_cutoff=".Length), out int transmitCutoff))
+                        {
+                            if (transmitCutoff > 0)
+                            {
+                                outerDistanceCutoff = transmitCutoff;
+                            }
+                            else
+                            {
+                                Console.WriteLine("Invalid Outer Player Transmit Cutoff value");
+                                Environment.Exit(0);
+                            }
+                        }
+                    }
+                    else if (line.StartsWith("static_update_rate="))
+                    {
+                        if (int.TryParse(line.Substring("static_update_rate=".Length), out int staticUpdateRateRaw))
+                        {
+                            if (staticUpdateRate > 0)
+                            {
+                                staticUpdateRate = staticUpdateRateRaw;
+                            }
+                            else
+                            {
+                                Console.WriteLine("Invalid Static Update Rate value");
                                 Environment.Exit(0);
                             }
                         }
@@ -118,7 +157,9 @@ namespace BabyStepsServer
                 {
                     "port=7777",
                     "password=",
-                    "player_transmit_cutoff=100"
+                    "player_transmit_cutoff=5",
+                    "outer_player_transmit_cutoff=100",
+                    "static_update_rate=1000"
                 };
                 File.WriteAllLines(configPath, lines);
                 Console.WriteLine("No settings.cfg file found, creating default one");
@@ -134,7 +175,7 @@ namespace BabyStepsServer
         public void Run()
         {
             _server.Start(port);
-            Console.WriteLine($"Server started on UDP port {port} " + 
+            Console.WriteLine($"Server started on UDP port {port} " +
                 (password == "cuzzillobochfoddy" ? "with no password" : $"with password {password}")
                 );
 
@@ -150,7 +191,7 @@ namespace BabyStepsServer
                 sw.Stop();
                 timeSinceLastBoneVectorUpdate += (int)sw.ElapsedMilliseconds;
 
-                if (timeSinceLastBoneVectorUpdate >= boneVectorUpdateInterval && !_isCulling)
+                if (timeSinceLastBoneVectorUpdate >= staticUpdateRate && !_isCulling)
                 {
                     timeSinceLastBoneVectorUpdate = 0;
                     _isCulling = true;
@@ -167,20 +208,60 @@ namespace BabyStepsServer
         private void HandleBoneBroadcasts()
         {
             int allowedSends = (int)(throttleUnits * targetFPS);
+            long now = Stopwatch.GetTimestamp();
+            double tickToMs = 1000.0 / Stopwatch.Frequency;
+            float updateIntervalMs = 1000f / targetFPS;
 
             for (int i = 0; i < allowedSends && boneBroadcastQueue.Count > 0; i++)
             {
                 var (from, data) = boneBroadcastQueue.Dequeue();
                 if (!_clients.ContainsKey(from)) continue;
+
+                var fromClient = _clients[from];
                 writer.Reset();
                 ushort totalLength = (ushort)(data.Length + 2);
                 writer.Put(totalLength);
                 writer.Put(data);
 
-                foreach (var client in _clients)
+                foreach (var kvp in _clients)
                 {
-                    if (client.Key == from || _clients[from].distantClients?.Contains(client.Key) == true) continue;
-                    client.Key.Send(writer, DeliveryMethod.Unreliable);
+                    var peer = kvp.Key;
+                    if (peer == from) continue;
+
+                    bool isDistant = fromClient.distantClients?.Contains(peer) == true;
+                    float effectiveMultiplier = 1f; // Default for nearby clients
+
+                    if (isDistant)
+                    {
+                        // Get distance between sender and receiver
+                        var targetClient = kvp.Value;
+                        float distance = Vector3.Distance(fromClient.position, targetClient.position);
+
+                        // Exponential falloff
+                        if (distance >= distanceCutoff)
+                        {
+                            // 0 at inner cutoff, 1 at outer cutoff
+                            float clamped = Math.Clamp((distance - distanceCutoff) / (outerDistanceCutoff - distanceCutoff), 0f, 1f);
+
+                            // Multiplier goes from 1 (normal rate) to (updateIntervalMs / 5000)
+                            // Ensures 5s update interval at outerDistanceCutoff
+                            float targetMultiplier = updateIntervalMs / 5000f;
+                            effectiveMultiplier = (float)Math.Exp(clamped * Math.Log(targetMultiplier));
+                        }
+                    }
+
+                    float sendInterval = updateIntervalMs / effectiveMultiplier;
+
+                    if (!fromClient.lastTransmitTimes.TryGetValue(peer, out long lastSent))
+                        lastSent = 0;
+
+                    double msSinceLastSend = (now - lastSent) * tickToMs;
+
+                    if (msSinceLastSend >= sendInterval)
+                    {
+                        peer.Send(writer, DeliveryMethod.Unreliable);
+                        fromClient.lastTransmitTimes[peer] = now;
+                    }
                 }
             }
         }
@@ -264,11 +345,12 @@ namespace BabyStepsServer
         {
             string incomingKey = request.Data.GetString();
 
-            if (incomingKey == password) request.Accept();
+            string assembledPassword = SERVER_VERSION + password;
+            if (incomingKey == assembledPassword) request.Accept();
             else
             {
                 request.Reject();
-                Console.WriteLine($"Client tried to connect with incorrect password");
+                Console.WriteLine($"Client tried to connect with incorrect password:{incomingKey}");
             }
         }
         public void OnNetworkReceiveUnconnected(IPEndPoint endPoint, NetPacketReader reader, UnconnectedMessageType messageType) { }
@@ -326,6 +408,7 @@ namespace BabyStepsServer
                 case 5: HandleAccessoryRemove(peer, client, data); break;
                 case 6: HandleJiminyUpdate(peer, client, data); break;
                 case 7: HandleCollisionToggleUpdate(peer, client, data); break;
+                case 8: HandleChatMessage(peer, client, data); break;
                 default: Console.WriteLine($"{client._uuid}: Unknown opcode {opcode}"); break;
             }
         }
@@ -417,6 +500,16 @@ namespace BabyStepsServer
             client._savedPackets[0x03] = packet;
 
             Broadcast(packet, DeliveryMethod.ReliableOrdered, exclude: peer);
+        }
+
+        private void HandleChatMessage(NetPeer peer, ClientInfo client, byte[] data)
+        {
+            List<byte> packet = new();
+            packet.Add(OPCODE_CMS);
+            packet.Add(client._uuid);
+            packet.AddRange(data.Skip(1));
+
+            Broadcast(packet.ToArray(), DeliveryMethod.ReliableOrdered, exclude: peer);
         }
 
         // --- UUID Management ---
