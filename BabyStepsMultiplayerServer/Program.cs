@@ -1,6 +1,7 @@
 ﻿using BabyStepsMultiplayerServer;
 using LiteNetLib;
 using LiteNetLib.Utils;
+using System;
 using System.Diagnostics;
 using System.Drawing;
 using System.Net;
@@ -40,7 +41,7 @@ namespace BabyStepsServer
         private const byte OPCODE_CTE = 0xA; // Collision Toggle Event
         private const byte OPCODE_CMS = 0xB; // Chat Message Send
 
-        private const string SERVER_VERSION = "103";
+        private const string SERVER_VERSION = "104";
 
         // --- Fields ---
         private NetManager _server;
@@ -58,7 +59,7 @@ namespace BabyStepsServer
         private float distantUpdateMultiplier = 0.05f;
 
         private readonly Queue<(NetPeer from, byte[] data)> boneBroadcastQueue = new();
-        private float staticUpdateRate = 5000f;
+        private float staticUpdateRate = 1000f;
 
         private volatile bool _isCulling = false;
         private readonly object _clientLock = new object();
@@ -157,8 +158,8 @@ namespace BabyStepsServer
                 {
                     "port=7777",
                     "password=",
-                    "player_transmit_cutoff=5",
-                    "outer_player_transmit_cutoff=100",
+                    "player_transmit_cutoff=10",
+                    "outer_player_transmit_cutoff=500",
                     "static_update_rate=1000"
                 };
                 File.WriteAllLines(configPath, lines);
@@ -245,7 +246,7 @@ namespace BabyStepsServer
 
                             // Multiplier goes from 1 (normal rate) to (updateIntervalMs / 5000)
                             // Ensures 5s update interval at outerDistanceCutoff
-                            float targetMultiplier = updateIntervalMs / 5000f;
+                            float targetMultiplier = updateIntervalMs / 2000f;
                             effectiveMultiplier = (float)Math.Exp(clamped * Math.Log(targetMultiplier));
                         }
                     }
@@ -276,7 +277,7 @@ namespace BabyStepsServer
                 return;
             }
 
-            Console.WriteLine($"Client connected: {uuid}");
+            //Console.WriteLine($"Client connected: {uuid}");
 
             var info = new ClientInfo { _peer = peer, _uuid = uuid };
             _clients[peer] = info;
@@ -306,7 +307,7 @@ namespace BabyStepsServer
             if (_clients.TryGetValue(peer, out var client))
             {
                 byte uuid = client._uuid;
-                Console.WriteLine($"Client {uuid} disconnected: {disconnectInfo.Reason}");
+                Console.WriteLine($"Player {client._displayName}[{uuid}] disconnected: {disconnectInfo.Reason}");
 
                 Broadcast(new byte[] { OPCODE_DCC, uuid }, DeliveryMethod.ReliableOrdered, exclude: peer);
 
@@ -350,7 +351,14 @@ namespace BabyStepsServer
             else
             {
                 request.Reject();
-                Console.WriteLine($"Client tried to connect with incorrect password:{incomingKey}");
+                if (incomingKey.StartsWith(SERVER_VERSION))
+                {
+                    Console.WriteLine($"Client tried to connect with incorrect password:{incomingKey.Skip(SERVER_VERSION.Length)}");
+                }
+                else
+                {
+                    Console.WriteLine($"Server version not compatible with this client version or invalid packet.");
+                }
             }
         }
         public void OnNetworkReceiveUnconnected(IPEndPoint endPoint, NetPacketReader reader, UnconnectedMessageType messageType) { }
@@ -372,10 +380,9 @@ namespace BabyStepsServer
 
                     if (data != null && data.Length >= 29)
                     {
-                        float posX = BitConverter.ToSingle(data, 1);
-                        float posY = BitConverter.ToSingle(data, 5);
-                        float posZ = BitConverter.ToSingle(data, 9);
-                        client.position = new Vector3(posX, posY, posZ);
+                        // 0 LOOP, 1,2,3 XCOORD, 4,5,6,7 YCOORD, 8,9,10,11 ZCOORD
+                        float posZ = BitConverter.ToSingle(data, 8);
+                        client.position = new Vector3(0, 0, posZ);
                     }
                 }
 
@@ -389,7 +396,7 @@ namespace BabyStepsServer
                     {
                         if (kvpA.Key == kvpB.Key) continue;
                         var clientB = kvpB.Value;
-                        float distance = Vector3.Distance(posA, clientB.position);
+                        float distance = Math.Abs(clientA.position.Z - clientB.position.Z);
                         if (distance > distanceCutoff)
                             clientA.distantClients.Add(kvpB.Key);
                     }
@@ -438,10 +445,13 @@ namespace BabyStepsServer
             if (client._color == null || client._displayName == null) firstReceive = true;
 
             client._color = Color.FromArgb(data[1], data[2], data[3]);
-            client._displayName = Encoding.UTF8.GetString(data, 4, data.Length - 4);
 
-            Console.WriteLine($"{client._uuid}: Set color to {client._color}");
-            Console.WriteLine($"{client._uuid}: Set nickname to {client._displayName}");
+            string receivedName = Encoding.UTF8.GetString(data, 4, data.Length - 4);
+            if (client._displayName == null) Console.WriteLine($"Player {receivedName}[{client._uuid}] has connected.");
+            else Console.WriteLine($"{client._displayName}[{client._uuid}] changed nickname to {receivedName}");
+            client._displayName = receivedName;
+
+            Console.WriteLine($"{client._displayName}[{client._uuid}] set color to {client._color}");
 
             if (firstReceive) Broadcast(new byte[] { OPCODE_ICC, client._uuid }, DeliveryMethod.ReliableOrdered, exclude: peer);
             Broadcast(GetClientInfoPacket(peer), DeliveryMethod.ReliableOrdered, exclude: peer);
@@ -507,7 +517,11 @@ namespace BabyStepsServer
             List<byte> packet = new();
             packet.Add(OPCODE_CMS);
             packet.Add(client._uuid);
-            packet.AddRange(data.Skip(1));
+
+            byte[] dataToSend = data.Skip(1).ToArray();
+            packet.AddRange(dataToSend);
+
+            Console.WriteLine($"{client._displayName}[{client._uuid}]: {Encoding.UTF8.GetString(dataToSend)}");
 
             Broadcast(packet.ToArray(), DeliveryMethod.ReliableOrdered, exclude: peer);
         }
