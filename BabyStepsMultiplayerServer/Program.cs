@@ -3,12 +3,12 @@ using LiteNetLib;
 using LiteNetLib.Utils;
 using System;
 using System.Diagnostics;
-using System.Drawing;
 using System.Net;
 using System.Net.Sockets;
 using System.Numerics;
 using System.Text;
 using System.Text.Json;
+using System.Threading.Tasks;
 
 namespace BabyStepsServer
 {
@@ -47,10 +47,19 @@ namespace BabyStepsServer
         private readonly object _clientLock = new object();
 
         // --- Entry Point ---
-        static void Main(string[] args)
+        static async Task Main(string[] args)
         {
-            Console.SetOut(new TimestampedTextWriter(Console.Out));
-            new Program().Run();
+            try
+            {
+                Console.Clear();
+                Console.SetOut(new TimestampedTextWriter(Console.Out));
+                await new Program().Run();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Fatal error: {ex}");
+                Console.ReadLine();
+            }
         }
 
         public Program()
@@ -66,7 +75,7 @@ namespace BabyStepsServer
             };
         }
 
-        public void Run()
+        public async Task Run()
         {
             CheckForUpdates();
 
@@ -92,11 +101,14 @@ namespace BabyStepsServer
                 {
                     timeSinceLastBoneVectorUpdate = 0;
                     _isCulling = true;
-                    Task.Run(() => CullDistantClients());
+
+                    // Unlikely to cause errors which is why I'm fine not awaiting this to keep things running smoothly
+                    Task.Run(() => CullDistantClients()); 
                 }
 
                 sw.Restart();
-                Thread.Sleep(1000 / targetFPS);
+                //Thread.Sleep(1000 / targetFPS);
+                await Task.Delay(1000 / targetFPS);
             }
         }
 
@@ -346,14 +358,14 @@ namespace BabyStepsServer
             var firstReceive = false;
             if (client._color == null || client._displayName == null) firstReceive = true;
 
-            client._color = Color.FromArgb(data[1], data[2], data[3]);
+            client._color = new RGBColor(data[1], data[2], data[3]);
 
             string receivedName = Encoding.UTF8.GetString(data, 4, data.Length - 4);
             if (client._displayName == null) Console.WriteLine($"Player {receivedName}[{client._uuid}] has connected.");
             else Console.WriteLine($"{client._displayName}[{client._uuid}] changed nickname to {receivedName}");
             client._displayName = receivedName;
 
-            Console.WriteLine($"{client._displayName}[{client._uuid}] set color to {client._color}");
+            Console.WriteLine($"{client._displayName}[{client._uuid}] set color to {client._color.ToString()}");
 
             if (firstReceive) Broadcast(new byte[] { OPCODE_ICC, client._uuid }, DeliveryMethod.ReliableOrdered, exclude: peer);
             Broadcast(GetClientInfoPacket(peer), DeliveryMethod.ReliableOrdered, exclude: peer);
@@ -485,9 +497,9 @@ namespace BabyStepsServer
             {
                 OPCODE_UCI,
                 info._uuid,
-                info._color.Value.R,
-                info._color.Value.G,
-                info._color.Value.B
+                info._color.R,
+                info._color.G,
+                info._color.B
             };
 
             final.AddRange(Encoding.UTF8.GetBytes(info._displayName));

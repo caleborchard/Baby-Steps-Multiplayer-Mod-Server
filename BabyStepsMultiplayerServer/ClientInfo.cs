@@ -1,7 +1,6 @@
 ﻿using LiteNetLib;
 using System;
 using System.Collections.Generic;
-using System.Drawing;
 using System.Linq;
 using System.Numerics;
 using System.Text;
@@ -14,7 +13,7 @@ namespace BabyStepsMultiplayerServer
         public required NetPeer _peer;
         public required byte _uuid;
         public string? _displayName;
-        public Color? _color;
+        public RGBColor? _color;
         public bool collisionsEnabled = true;
         public bool jiminyState = false;
         public byte _lbKickoffPoint = 0;
