@@ -15,6 +15,8 @@ The server runs on port 7777 by default and has a theoretical limit of 255 playe
 
 A 'settings.cfg' file will be auto generated on first startup. Inside you can edit the port and password. Leave the password blank to have no password, but a port must be typed in the config.
 
+If the console window does not open on Windows, you probably need to install the DotNet 8.0 Runtime which is linked at the bottom.
+
 [Join the Discord!](https://discord.gg/fpBQW5cKdE)
 ---
 
@@ -22,3 +24,4 @@ A 'settings.cfg' file will be auto generated on first startup. Inside you can ed
 - [Baby Steps: Multiplayer Mod Client](https://github.com/caleborchard/Baby-Steps-Multiplayer-Mod-Client)
 - [Baby Steps](https://www.babystepsgame.com/)
 - [LiteNetLib](https://github.com/RevenantX/LiteNetLib)
+- [DotNet 8.0 Runtime](https://dotnet.microsoft.com/en-us/download/dotnet/thank-you/runtime-8.0.20-windows-x64-installer)
