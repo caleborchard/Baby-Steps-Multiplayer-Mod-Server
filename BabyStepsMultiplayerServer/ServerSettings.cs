@@ -18,6 +18,8 @@ namespace BabyStepsMultiplayerServer
         public float TelemetryUpdateInterval { get; set; } = 5000f; // ms
         public bool VoiceChatEnabled { get; set; } = true;
 
+        public string BotToken { get; set; } = "";
+
         private const string CONFIG_PATH = "settings.cfg";
 
         public static ServerSettings Load()
@@ -117,6 +119,18 @@ namespace BabyStepsMultiplayerServer
                         if (bool.TryParse(line.Substring("voice_chat_enabled=".Length), out bool vcEnabled))
                             settings.VoiceChatEnabled = vcEnabled;
                     }
+                    else if (line.StartsWith("bot_token="))
+                    {
+                        string token = line.Substring("bot_token=".Length);
+                        if(token.Length > 0)
+                        {
+                            settings.BotToken = token;
+                        }
+                        else
+                        {
+                            Console.WriteLine("No bot token provided, discord functionality disabled");
+                        }
+                    }
                 }
             }
             else
@@ -140,7 +154,8 @@ namespace BabyStepsMultiplayerServer
                 "max_bandwidth_kbps=512",
                 "telemetry_enabled=false",
                 "telemetry_update_interval=5000",
-                "voice_chat_enabled=true"
+                "voice_chat_enabled=true",
+                "bot_token=0"
             };
             File.WriteAllLines(CONFIG_PATH, lines);
         }
