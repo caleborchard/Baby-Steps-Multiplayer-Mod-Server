@@ -1,6 +1,9 @@
 ﻿using BabyStepsMultiplayerServer;
 using LiteNetLib;
 using LiteNetLib.Utils;
+using NetCord.Gateway;
+using NetCord.Logging;
+using NetCord;
 using System;
 using System.Diagnostics;
 using System.Net;
@@ -46,6 +49,9 @@ namespace BabyStepsServer
         private volatile bool _isCulling = false;
         private readonly object _clientLock = new object();
 
+        private GatewayClient client;
+        private bool hasDiscord = false;
+
         // --- Entry Point ---
         static async Task Main(string[] args)
         {
@@ -73,11 +79,45 @@ namespace BabyStepsServer
                 IPv6Enabled = false,
                 DisconnectTimeout = 15000
             };
+
+
+            if (_settings.BotToken.Length > 0)
+            {
+                client = new(new BotToken(_settings.BotToken), new GatewayClientConfiguration
+                {
+                    Logger = new ConsoleLogger(),
+                });
+                hasDiscord = true;
+            }
+        }
+
+        public void updateStatus()
+        {
+            if (hasDiscord)
+            {
+                PresenceProperties properties = new PresenceProperties(UserStatusType.Online);
+                properties.AddActivities(new UserActivityProperties($"{_clients.Count} players online", UserActivityType.Watching));
+                client.UpdatePresenceAsync(properties);
+            }
         }
 
         public async Task Run()
         {
             CheckForUpdates();
+
+            if (hasDiscord)
+            {
+                try
+                {
+                    await client.StartAsync();
+                    updateStatus();
+                }
+                catch(Exception e)
+                {
+                    Console.WriteLine($"Failed to start discord: {e}");
+                    hasDiscord = false;
+                }
+            }
 
             _server.Start(_settings.Port);
             Console.WriteLine($"Server started on UDP port {_settings.Port} " +
@@ -210,6 +250,7 @@ namespace BabyStepsServer
                     }
                 }
             }
+            updateStatus();
         }
 
         public void OnPeerDisconnected(NetPeer peer, DisconnectInfo disconnectInfo)
@@ -225,6 +266,7 @@ namespace BabyStepsServer
                 _lastSeenSequencePerClient.Remove(uuid);
                 ReclaimUUID(uuid);
             }
+            updateStatus();
         }
 
         public void OnNetworkReceive(NetPeer peer, NetPacketReader reader, byte channelNum, DeliveryMethod deliveryMethod)
