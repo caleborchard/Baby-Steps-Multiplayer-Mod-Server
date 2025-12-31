@@ -49,8 +49,8 @@ namespace BabyStepsServer
         private volatile bool _isCulling = false;
         private readonly object _clientLock = new object();
 
-        private GatewayClient client;
-        private bool hasDiscord = false;
+        private GatewayClient? _discordClient;
+        private bool _hasDiscord = false;
 
         // --- Entry Point ---
         static async Task Main(string[] args)
@@ -83,21 +83,21 @@ namespace BabyStepsServer
 
             if (_settings.BotToken.Length > 0)
             {
-                client = new(new BotToken(_settings.BotToken), new GatewayClientConfiguration
+                _discordClient = new(new BotToken(_settings.BotToken), new GatewayClientConfiguration
                 {
                     Logger = new ConsoleLogger(),
                 });
-                hasDiscord = true;
+                _hasDiscord = true;
             }
         }
 
         public void updateStatus()
         {
-            if (hasDiscord)
+            if (_hasDiscord && _discordClient!=null)
             {
-                PresenceProperties properties = new PresenceProperties(UserStatusType.Online);
+                PresenceProperties properties = new(UserStatusType.Online);
                 properties.AddActivities(new UserActivityProperties($"{_clients.Count} players online", UserActivityType.Watching));
-                client.UpdatePresenceAsync(properties);
+                _discordClient.UpdatePresenceAsync(properties);
             }
         }
 
@@ -105,17 +105,17 @@ namespace BabyStepsServer
         {
             CheckForUpdates();
 
-            if (hasDiscord)
+            if (_hasDiscord && _discordClient!=null)
             {
                 try
                 {
-                    await client.StartAsync();
+                    await _discordClient.StartAsync();
                     updateStatus();
                 }
                 catch(Exception e)
                 {
                     Console.WriteLine($"Failed to start discord: {e}");
-                    hasDiscord = false;
+                    _hasDiscord = false;
                 }
             }
 
