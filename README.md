@@ -11,7 +11,9 @@
 
 The **Baby Steps: Multiplayer Mod** is an unofficial [MelonLoader](https://melonwiki.xyz/) mod that adds **full body multiplayer presence** to the demo and full versions of *Baby Steps*.  
 
-The server runs on port 7777 by default and has a theoretical limit of 255 players. To run on Linux, use Wine.
+The server runs on port 7777 by default and has a theoretical limit of 255 players.
+
+You can run this natively on Linux with dotnet8.0, by running `dotnet BabyStepsMultiplayerServer.dll`
 
 A 'settings.cfg' file will be auto generated on first startup. Inside you can edit the port and password. Leave the password blank to have no password, but a port must be typed in the config.
 
