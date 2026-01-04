@@ -28,7 +28,7 @@ namespace BabyStepsServer
         private const byte OPCODE_CMS = 0x0B;
         private const byte OPCODE_PCF = 0x0C;
 
-        private const string SERVER_VERSION = "105";
+        private const string SERVER_VERSION = "106";
         private const string GITHUB_REPO = "https://github.com/caleborchard/Baby-Steps-Multiplayer-Mod-Server";
 
         // --- Fields ---
@@ -37,6 +37,7 @@ namespace BabyStepsServer
         private readonly NetDataWriter writer = new();
         private ServerSettings _settings;
         private BandwidthManager _bandwidthManager;
+        private DiscordWebhookHelper _discordWebhook;
 
         private HashSet<byte> _usedUUIDs = new HashSet<byte>();
         private const byte MAX_UUID = 254; // Reserve 255 for errors
@@ -45,6 +46,8 @@ namespace BabyStepsServer
         private readonly int targetFPS = 60;
         private volatile bool _isCulling = false;
         private readonly object _clientLock = new object();
+
+        private long _uptimeMs = 0;
 
         // --- Entry Point ---
         static async Task Main(string[] args)
@@ -66,6 +69,7 @@ namespace BabyStepsServer
         {
             _settings = ServerSettings.Load();
             _bandwidthManager = new BandwidthManager(_settings, targetFPS, _clients);
+            _discordWebhook = new DiscordWebhookHelper(_settings.DiscordWebhookUrl, _settings.DiscordWebhookEnabled);
 
             _server = new NetManager(this)
             {
@@ -84,18 +88,24 @@ namespace BabyStepsServer
                 (_settings.Password == "cuzzillobochfoddy" ? "with no password" : $"with password {_settings.Password}")
             );
             Console.WriteLine($"Bandwidth limit: {_settings.MaxBandwidthKbps} KB/s | Telemetry: {(_settings.TelemetryEnabled ? "ON" : "OFF")}");
+            Console.WriteLine($"Discord Webhook: {(_settings.DiscordWebhookEnabled ? "ON" : "OFF")}");
 
-            Stopwatch sw = new Stopwatch();
-            sw.Start();
+            Stopwatch frameSw = new Stopwatch();
+            Stopwatch uptimeSw = new Stopwatch();
+            frameSw.Start();
+            uptimeSw.Start();
             int timeSinceLastBoneVectorUpdate = 0;
+            _uptimeMs = 0;
 
             while (true)
             {
                 _server.PollEvents();
                 _bandwidthManager.ProcessQueues();
 
-                sw.Stop();
-                timeSinceLastBoneVectorUpdate += (int)sw.ElapsedMilliseconds;
+                frameSw.Stop();
+                timeSinceLastBoneVectorUpdate += (int)frameSw.ElapsedMilliseconds;
+
+                _uptimeMs = uptimeSw.ElapsedMilliseconds;
 
                 if (timeSinceLastBoneVectorUpdate >= _settings.StaticUpdateRate && !_isCulling)
                 {
@@ -103,10 +113,10 @@ namespace BabyStepsServer
                     _isCulling = true;
 
                     // Unlikely to cause errors which is why I'm fine not awaiting this to keep things running smoothly
-                    Task.Run(() => CullDistantClients()); 
+                    Task.Run(() => CullDistantClients());
                 }
 
-                sw.Restart();
+                frameSw.Restart();
                 //Thread.Sleep(1000 / targetFPS);
                 await Task.Delay(1000 / targetFPS);
             }
@@ -191,7 +201,10 @@ namespace BabyStepsServer
             var info = new ClientInfo { _peer = peer, _uuid = uuid };
             _clients[peer] = info;
 
-            Send(peer, new byte[] { OPCODE_UID, uuid }, DeliveryMethod.ReliableOrdered);
+            List<byte> bytes = new List<byte>() { OPCODE_UID, uuid };
+            bytes.AddRange(BitConverter.GetBytes(_uptimeMs));
+
+            Send(peer, bytes.ToArray(), DeliveryMethod.ReliableOrdered);
 
             foreach (var client in _clients)
             {
@@ -218,6 +231,9 @@ namespace BabyStepsServer
             {
                 byte uuid = client._uuid;
                 Console.WriteLine($"Player {client._displayName}[{uuid}] disconnected: {disconnectInfo.Reason}");
+
+                // Send Discord notification
+                _ = _discordWebhook.SendPlayerLeftAsync(client._displayName ?? "Unknown", uuid);
 
                 Broadcast(new byte[] { OPCODE_DCC, uuid }, DeliveryMethod.ReliableOrdered, exclude: peer);
 
@@ -348,6 +364,7 @@ namespace BabyStepsServer
                 List<byte> packet = new() { OPCODE_UBP, client._uuid, client._lbKickoffPoint };
                 packet.AddRange(BitConverter.GetBytes(seq));
                 packet.AddRange(rawTransformData);
+                packet.AddRange(BitConverter.GetBytes(_uptimeMs)); //long, 8 bytes
 
                 _bandwidthManager.EnqueueBoneUpdate(peer, packet.ToArray());
             }
@@ -361,11 +378,26 @@ namespace BabyStepsServer
             client._color = new RGBColor(data[1], data[2], data[3]);
 
             string receivedName = Encoding.UTF8.GetString(data, 4, data.Length - 4);
-            if (client._displayName == null) Console.WriteLine($"Player {receivedName}[{client._uuid}] has connected.");
-            else Console.WriteLine($"{client._displayName}[{client._uuid}] changed nickname to {receivedName}");
-            client._displayName = receivedName;
 
-            Console.WriteLine($"{client._displayName}[{client._uuid}] set color to {client._color.ToString()}");
+            if (client._displayName == null)
+            {
+                Console.WriteLine($"Player {receivedName}[{client._uuid}] has connected.");
+                client._displayName = receivedName;
+
+                // Send Discord notification for join
+                _ = _discordWebhook.SendPlayerJoinedAsync(receivedName, client._uuid);
+            }
+            else if (client._displayName != receivedName)
+            {
+                Console.WriteLine($"{client._displayName}[{client._uuid}] changed nickname to {receivedName}");
+
+                // Send Discord notification for name change
+                _ = _discordWebhook.SendPlayerNameChangedAsync(client._displayName, receivedName, client._uuid);
+
+                client._displayName = receivedName;
+            }
+
+            Console.WriteLine($"{client._displayName}[{client._uuid}] set color to {client._color.GetString()}");
 
             if (firstReceive) Broadcast(new byte[] { OPCODE_ICC, client._uuid }, DeliveryMethod.ReliableOrdered, exclude: peer);
             Broadcast(GetClientInfoPacket(peer), DeliveryMethod.ReliableOrdered, exclude: peer);

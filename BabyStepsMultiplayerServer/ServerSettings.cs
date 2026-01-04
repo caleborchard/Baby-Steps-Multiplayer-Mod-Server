@@ -17,6 +17,8 @@ namespace BabyStepsMultiplayerServer
         public bool TelemetryEnabled { get; set; } = false;
         public float TelemetryUpdateInterval { get; set; } = 5000f; // ms
         public bool VoiceChatEnabled { get; set; } = true;
+        public string DiscordWebhookUrl { get; set; } = "";
+        public bool DiscordWebhookEnabled { get; set; } = false;
 
         private const string CONFIG_PATH = "settings.cfg";
 
@@ -117,6 +119,16 @@ namespace BabyStepsMultiplayerServer
                         if (bool.TryParse(line.Substring("voice_chat_enabled=".Length), out bool vcEnabled))
                             settings.VoiceChatEnabled = vcEnabled;
                     }
+                    else if (line.StartsWith("discord_webhook_url="))
+                    {
+                        string webhookUrl = line.Substring("discord_webhook_url=".Length);
+                        settings.DiscordWebhookUrl = webhookUrl;
+                    }
+                    else if (line.StartsWith("discord_webhook_enabled="))
+                    {
+                        if (bool.TryParse(line.Substring("discord_webhook_enabled=".Length), out bool webhookEnabled))
+                            settings.DiscordWebhookEnabled = webhookEnabled;
+                    }
                 }
             }
             else
@@ -140,7 +152,9 @@ namespace BabyStepsMultiplayerServer
                 "max_bandwidth_kbps=512",
                 "telemetry_enabled=false",
                 "telemetry_update_interval=5000",
-                "voice_chat_enabled=true"
+                "voice_chat_enabled=true",
+                "discord_webhook_url=",
+                "discord_webhook_enabled=false"
             };
             File.WriteAllLines(CONFIG_PATH, lines);
         }
