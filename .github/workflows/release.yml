@@ -116,7 +116,6 @@ jobs:
         context: .
         file: docker/Dockerfile
         push: true
-        #FIXME: change username to caleb 
         tags: |
-          ghcr.io/azim/baby-steps-server:${{ github.event.inputs.release_tag }}
-          ghcr.io/azim/baby-steps-server:latest
+          ghcr.io/caleborchard/baby-steps-server:${{ github.event.inputs.release_tag }}
+          ghcr.io/caleborchard/baby-steps-server:latest
