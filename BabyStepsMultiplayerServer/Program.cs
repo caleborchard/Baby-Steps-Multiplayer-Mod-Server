@@ -91,6 +91,7 @@ namespace BabyStepsServer
             CheckForUpdates();
 
             var startupInfo = _serverLifecycleTracker.MarkServerStarted();
+            _ = _discordWebhook.SendServerStartedAsync(startupInfo.Downtime, startupInfo.PreviousRunLikelyCrashed);
 
             _server.Start(_settings.Port);
             Console.WriteLine($"Server started on UDP port {_settings.Port} " +
@@ -98,8 +99,6 @@ namespace BabyStepsServer
             );
             Console.WriteLine($"Bandwidth limit: {_settings.MaxBandwidthKbps} KB/s | Telemetry: {(_settings.TelemetryEnabled ? "ON" : "OFF")}");
             Console.WriteLine($"Discord Webhook: {(_settings.DiscordWebhookEnabled ? "ON" : "OFF")}");
-
-            _ = _discordWebhook.SendServerStartedAsync(startupInfo.Downtime, startupInfo.PreviousRunLikelyCrashed);
 
             Stopwatch frameSw = new Stopwatch();
             Stopwatch uptimeSw = new Stopwatch();
@@ -437,7 +436,7 @@ namespace BabyStepsServer
                 Console.WriteLine($"{client._displayName}[{client._uuid}] changed nickname to {receivedName}");
 
                 // Send Discord notification for name change
-                _ = _discordWebhook.SendPlayerNameChangedAsync(client._displayName, receivedName, client._uuid, _clients.Count);
+                _ = _discordWebhook.SendPlayerNameChangedAsync(client._displayName, receivedName, client._uuid);
 
                 client._displayName = receivedName;
             }
