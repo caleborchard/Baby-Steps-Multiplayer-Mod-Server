@@ -38,6 +38,7 @@ namespace BabyStepsServer
         private ServerSettings _settings;
         private BandwidthManager _bandwidthManager;
         private DiscordWebhookHelper _discordWebhook;
+        private readonly ServerLifecycleTracker _serverLifecycleTracker;
 
         private HashSet<byte> _usedUUIDs = new HashSet<byte>();
         private const byte MAX_UUID = 254; // Reserve 255 for errors
@@ -46,6 +47,8 @@ namespace BabyStepsServer
         private readonly int targetFPS = 60;
         private volatile bool _isCulling = false;
         private readonly object _clientLock = new object();
+        private volatile bool _isRunning = true;
+        private bool _shutdownRecorded = false;
 
         private long _uptimeMs = 0;
 
@@ -70,6 +73,10 @@ namespace BabyStepsServer
             _settings = ServerSettings.Load();
             _bandwidthManager = new BandwidthManager(_settings, targetFPS, _clients);
             _discordWebhook = new DiscordWebhookHelper(_settings.DiscordWebhookUrl, _settings.DiscordWebhookEnabled);
+            _serverLifecycleTracker = new ServerLifecycleTracker();
+
+            Console.CancelKeyPress += OnCancelKeyPress;
+            AppDomain.CurrentDomain.ProcessExit += OnProcessExit;
 
             _server = new NetManager(this)
             {
@@ -83,6 +90,8 @@ namespace BabyStepsServer
         {
             CheckForUpdates();
 
+            var startupInfo = _serverLifecycleTracker.MarkServerStarted();
+
             _server.Start(_settings.Port);
             Console.WriteLine($"Server started on UDP port {_settings.Port} " +
                 (_settings.Password == "cuzzillobochfoddy" ? "with no password" : $"with password {_settings.Password}")
@@ -90,36 +99,72 @@ namespace BabyStepsServer
             Console.WriteLine($"Bandwidth limit: {_settings.MaxBandwidthKbps} KB/s | Telemetry: {(_settings.TelemetryEnabled ? "ON" : "OFF")}");
             Console.WriteLine($"Discord Webhook: {(_settings.DiscordWebhookEnabled ? "ON" : "OFF")}");
 
+            _ = _discordWebhook.SendServerStartedAsync(startupInfo.Downtime, startupInfo.PreviousRunLikelyCrashed);
+
             Stopwatch frameSw = new Stopwatch();
             Stopwatch uptimeSw = new Stopwatch();
             frameSw.Start();
             uptimeSw.Start();
+            long lastHeartbeatAtMs = 0;
             int timeSinceLastBoneVectorUpdate = 0;
             _uptimeMs = 0;
 
-            while (true)
+            try
             {
-                _server.PollEvents();
-                _bandwidthManager.ProcessQueues();
-
-                frameSw.Stop();
-                timeSinceLastBoneVectorUpdate += (int)frameSw.ElapsedMilliseconds;
-
-                _uptimeMs = uptimeSw.ElapsedMilliseconds;
-
-                if (timeSinceLastBoneVectorUpdate >= _settings.StaticUpdateRate && !_isCulling)
+                while (_isRunning)
                 {
-                    timeSinceLastBoneVectorUpdate = 0;
-                    _isCulling = true;
+                    _server.PollEvents();
+                    _bandwidthManager.ProcessQueues();
 
-                    // Unlikely to cause errors which is why I'm fine not awaiting this to keep things running smoothly
-                    Task.Run(() => CullDistantClients());
+                    frameSw.Stop();
+                    timeSinceLastBoneVectorUpdate += (int)frameSw.ElapsedMilliseconds;
+
+                    _uptimeMs = uptimeSw.ElapsedMilliseconds;
+
+                    if (_uptimeMs - lastHeartbeatAtMs >= 5000)
+                    {
+                        _serverLifecycleTracker.UpdateHeartbeat();
+                        lastHeartbeatAtMs = _uptimeMs;
+                    }
+
+                    if (timeSinceLastBoneVectorUpdate >= _settings.StaticUpdateRate && !_isCulling)
+                    {
+                        timeSinceLastBoneVectorUpdate = 0;
+                        _isCulling = true;
+
+                        // Unlikely to cause errors which is why I'm fine not awaiting this to keep things running smoothly
+                        Task.Run(() => CullDistantClients());
+                    }
+
+                    frameSw.Restart();
+                    await Task.Delay(1000 / targetFPS);
                 }
-
-                frameSw.Restart();
-                //Thread.Sleep(1000 / targetFPS);
-                await Task.Delay(1000 / targetFPS);
             }
+            finally
+            {
+                RecordCleanShutdown();
+                _server.Stop();
+            }
+        }
+
+        private void OnCancelKeyPress(object? sender, ConsoleCancelEventArgs e)
+        {
+            e.Cancel = true;
+            _isRunning = false;
+        }
+
+        private void OnProcessExit(object? sender, EventArgs e)
+        {
+            RecordCleanShutdown();
+        }
+
+        private void RecordCleanShutdown()
+        {
+            if (_shutdownRecorded)
+                return;
+
+            _shutdownRecorded = true;
+            _serverLifecycleTracker.MarkCleanShutdown();
         }
 
         private void CheckForUpdates()
@@ -232,14 +277,14 @@ namespace BabyStepsServer
                 byte uuid = client._uuid;
                 Console.WriteLine($"Player {client._displayName}[{uuid}] disconnected: {disconnectInfo.Reason}");
 
-                // Send Discord notification
-                _ = _discordWebhook.SendPlayerLeftAsync(client._displayName ?? "Unknown", uuid);
-
                 Broadcast(new byte[] { OPCODE_DCC, uuid }, DeliveryMethod.ReliableOrdered, exclude: peer);
 
                 _clients.Remove(peer);
                 _lastSeenSequencePerClient.Remove(uuid);
                 ReclaimUUID(uuid);
+
+                // Send Discord notification
+                _ = _discordWebhook.SendPlayerLeftAsync(client._displayName ?? "Unknown", uuid, _clients.Count);
             }
         }
 
@@ -385,14 +430,14 @@ namespace BabyStepsServer
                 client._displayName = receivedName;
 
                 // Send Discord notification for join
-                _ = _discordWebhook.SendPlayerJoinedAsync(receivedName, client._uuid);
+                _ = _discordWebhook.SendPlayerJoinedAsync(receivedName, client._uuid, _clients.Count);
             }
             else if (client._displayName != receivedName)
             {
                 Console.WriteLine($"{client._displayName}[{client._uuid}] changed nickname to {receivedName}");
 
                 // Send Discord notification for name change
-                _ = _discordWebhook.SendPlayerNameChangedAsync(client._displayName, receivedName, client._uuid);
+                _ = _discordWebhook.SendPlayerNameChangedAsync(client._displayName, receivedName, client._uuid, _clients.Count);
 
                 client._displayName = receivedName;
             }
