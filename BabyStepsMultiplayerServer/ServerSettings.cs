@@ -22,7 +22,7 @@ namespace BabyStepsMultiplayerServer
 
         private const string CONFIG_PATH = "settings.cfg";
 
-        public static ServerSettings Load()
+        public static ServerSettings Load(string[]? launchArgs = null)
         {
             var settings = new ServerSettings();
 
@@ -30,104 +30,9 @@ namespace BabyStepsMultiplayerServer
             {
                 foreach (var line in File.ReadAllLines(CONFIG_PATH))
                 {
-                    if (line.StartsWith("port="))
+                    if (TryGetKeyValue(line, out string key, out string value))
                     {
-                        if (int.TryParse(line.Substring("port=".Length), out int parsedPort))
-                        {
-                            if (parsedPort > 0 && parsedPort < 65535)
-                                settings.Port = parsedPort;
-                            else
-                            {
-                                Console.WriteLine("Invalid port in config!");
-                                Environment.Exit(0);
-                            }
-                        }
-                    }
-                    else if (line.StartsWith("password="))
-                    {
-                        string parsedPwd = line.Substring("password=".Length);
-                        if (parsedPwd.Length > 0)
-                            settings.Password = parsedPwd;
-                    }
-                    else if (line.StartsWith("player_transmit_cutoff="))
-                    {
-                        if (int.TryParse(line.Substring("player_transmit_cutoff=".Length), out int cutoff))
-                        {
-                            if (cutoff > 0)
-                                settings.DistanceCutoff = cutoff;
-                            else
-                            {
-                                Console.WriteLine("Invalid Player Transmit Cutoff value");
-                                Environment.Exit(0);
-                            }
-                        }
-                    }
-                    else if (line.StartsWith("outer_player_transmit_cutoff="))
-                    {
-                        if (int.TryParse(line.Substring("outer_player_transmit_cutoff=".Length), out int cutoff))
-                        {
-                            if (cutoff > 0)
-                                settings.OuterDistanceCutoff = cutoff;
-                            else
-                            {
-                                Console.WriteLine("Invalid Outer Player Transmit Cutoff value");
-                                Environment.Exit(0);
-                            }
-                        }
-                    }
-                    else if (line.StartsWith("static_update_rate="))
-                    {
-                        if (float.TryParse(line.Substring("static_update_rate=".Length), out float rate))
-                        {
-                            if (rate > 0)
-                                settings.StaticUpdateRate = rate;
-                            else
-                            {
-                                Console.WriteLine("Invalid Static Update Rate value");
-                                Environment.Exit(0);
-                            }
-                        }
-                    }
-                    else if (line.StartsWith("max_bandwidth_kbps="))
-                    {
-                        if (float.TryParse(line.Substring("max_bandwidth_kbps=".Length), out float bw))
-                        {
-                            if (bw > 0)
-                                settings.MaxBandwidthKbps = bw;
-                            else
-                            {
-                                Console.WriteLine("Invalid Max Bandwidth value");
-                                Environment.Exit(0);
-                            }
-                        }
-                    }
-                    else if (line.StartsWith("telemetry_enabled="))
-                    {
-                        if (bool.TryParse(line.Substring("telemetry_enabled=".Length), out bool enabled))
-                            settings.TelemetryEnabled = enabled;
-                    }
-                    else if (line.StartsWith("telemetry_update_interval="))
-                    {
-                        if (float.TryParse(line.Substring("telemetry_update_interval=".Length), out float interval))
-                        {
-                            if (interval > 0)
-                                settings.TelemetryUpdateInterval = interval;
-                        }
-                    }
-                    else if (line.StartsWith("voice_chat_enabled="))
-                    {
-                        if (bool.TryParse(line.Substring("voice_chat_enabled=".Length), out bool vcEnabled))
-                            settings.VoiceChatEnabled = vcEnabled;
-                    }
-                    else if (line.StartsWith("discord_webhook_url="))
-                    {
-                        string webhookUrl = line.Substring("discord_webhook_url=".Length);
-                        settings.DiscordWebhookUrl = webhookUrl;
-                    }
-                    else if (line.StartsWith("discord_webhook_enabled="))
-                    {
-                        if (bool.TryParse(line.Substring("discord_webhook_enabled=".Length), out bool webhookEnabled))
-                            settings.DiscordWebhookEnabled = webhookEnabled;
+                        settings.ApplySetting(key, value, "config");
                     }
                 }
             }
@@ -137,7 +42,175 @@ namespace BabyStepsMultiplayerServer
                 Console.WriteLine("No settings.cfg file found, creating default one");
             }
 
+            settings.ApplyLaunchOverrides(launchArgs);
+
             return settings;
+        }
+
+        private static bool TryGetKeyValue(string line, out string key, out string value)
+        {
+            key = string.Empty;
+            value = string.Empty;
+
+            if (string.IsNullOrWhiteSpace(line))
+                return false;
+
+            int equalsIndex = line.IndexOf('=');
+            if (equalsIndex <= 0)
+                return false;
+
+            key = line.Substring(0, equalsIndex);
+            value = line.Substring(equalsIndex + 1);
+            return true;
+        }
+
+        private void ApplyLaunchOverrides(string[]? launchArgs)
+        {
+            if (launchArgs == null || launchArgs.Length == 0)
+                return;
+
+            for (int i = 0; i < launchArgs.Length; i++)
+            {
+                var arg = launchArgs[i];
+                if (!arg.StartsWith("--"))
+                    continue;
+
+                string key;
+                string value;
+
+                int equalsIndex = arg.IndexOf('=');
+                if (equalsIndex > 2)
+                {
+                    key = arg.Substring(2, equalsIndex - 2);
+                    value = arg.Substring(equalsIndex + 1);
+                }
+                else
+                {
+                    if (i + 1 >= launchArgs.Length || launchArgs[i + 1].StartsWith("--"))
+                        continue;
+
+                    key = arg.Substring(2);
+                    value = launchArgs[++i];
+                }
+
+                value = TrimWrappingQuotes(value);
+                ApplySetting(key, value, "launch options");
+            }
+        }
+
+        private static string TrimWrappingQuotes(string value)
+        {
+            if (value.Length >= 2)
+            {
+                if ((value.StartsWith('"') && value.EndsWith('"')) ||
+                    (value.StartsWith('\'') && value.EndsWith('\'')))
+                {
+                    return value.Substring(1, value.Length - 2);
+                }
+            }
+
+            return value;
+        }
+
+        private void ApplySetting(string key, string value, string source)
+        {
+            if (key == "port")
+            {
+                if (int.TryParse(value, out int parsedPort))
+                {
+                    if (parsedPort > 0 && parsedPort < 65535)
+                        Port = parsedPort;
+                    else
+                    {
+                        Console.WriteLine($"Invalid port in {source}!");
+                        Environment.Exit(0);
+                    }
+                }
+            }
+            else if (key == "password")
+            {
+                if (value.Length > 0)
+                    Password = value;
+            }
+            else if (key == "player_transmit_cutoff")
+            {
+                if (int.TryParse(value, out int cutoff))
+                {
+                    if (cutoff > 0)
+                        DistanceCutoff = cutoff;
+                    else
+                    {
+                        Console.WriteLine($"Invalid Player Transmit Cutoff value in {source}");
+                        Environment.Exit(0);
+                    }
+                }
+            }
+            else if (key == "outer_player_transmit_cutoff")
+            {
+                if (int.TryParse(value, out int cutoff))
+                {
+                    if (cutoff > 0)
+                        OuterDistanceCutoff = cutoff;
+                    else
+                    {
+                        Console.WriteLine($"Invalid Outer Player Transmit Cutoff value in {source}");
+                        Environment.Exit(0);
+                    }
+                }
+            }
+            else if (key == "static_update_rate")
+            {
+                if (float.TryParse(value, out float rate))
+                {
+                    if (rate > 0)
+                        StaticUpdateRate = rate;
+                    else
+                    {
+                        Console.WriteLine($"Invalid Static Update Rate value in {source}");
+                        Environment.Exit(0);
+                    }
+                }
+            }
+            else if (key == "max_bandwidth_kbps")
+            {
+                if (float.TryParse(value, out float bw))
+                {
+                    if (bw > 0)
+                        MaxBandwidthKbps = bw;
+                    else
+                    {
+                        Console.WriteLine($"Invalid Max Bandwidth value in {source}");
+                        Environment.Exit(0);
+                    }
+                }
+            }
+            else if (key == "telemetry_enabled")
+            {
+                if (bool.TryParse(value, out bool enabled))
+                    TelemetryEnabled = enabled;
+            }
+            else if (key == "telemetry_update_interval")
+            {
+                if (float.TryParse(value, out float interval))
+                {
+                    if (interval > 0)
+                        TelemetryUpdateInterval = interval;
+                }
+            }
+            else if (key == "voice_chat_enabled")
+            {
+                if (bool.TryParse(value, out bool vcEnabled))
+                    VoiceChatEnabled = vcEnabled;
+            }
+            else if (key == "discord_webhook_url")
+            {
+                DiscordWebhookUrl = value;
+            }
+            else if (key == "discord_webhook_enabled")
+            {
+                if (bool.TryParse(value, out bool webhookEnabled))
+                    DiscordWebhookEnabled = webhookEnabled;
+            }
         }
 
         private void CreateDefaultConfig()

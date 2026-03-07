@@ -59,7 +59,7 @@ namespace BabyStepsServer
             {
                 Console.Clear();
                 Console.SetOut(new TimestampedTextWriter(Console.Out));
-                await new Program().Run();
+                await new Program(args).Run();
             }
             catch (Exception ex)
             {
@@ -68,9 +68,9 @@ namespace BabyStepsServer
             }
         }
 
-        public Program()
+        public Program(string[]? args = null)
         {
-            _settings = ServerSettings.Load();
+            _settings = ServerSettings.Load(args);
             _bandwidthManager = new BandwidthManager(_settings, targetFPS, _clients);
             _discordWebhook = new DiscordWebhookHelper(_settings.DiscordWebhookUrl, _settings.DiscordWebhookEnabled);
             _serverLifecycleTracker = new ServerLifecycleTracker();
