@@ -129,8 +129,8 @@ namespace BabyStepsMultiplayerServer
             }
             else if (key == "password")
             {
-                if (value.Length > 0)
-                    Password = value;
+                if (value.Length > 0) Password = value;
+                else if (value.Length == 0) Password = "cuzzillobochfoddy"; // Reset to default if empty
             }
             else if (key == "player_transmit_cutoff")
             {
