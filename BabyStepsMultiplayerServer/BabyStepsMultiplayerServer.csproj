@@ -11,4 +11,8 @@
     <PackageReference Include="LiteNetLib" Version="1.3.1" />
   </ItemGroup>
 
+  <ItemGroup>
+    <None Include="start_server.sh" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>
