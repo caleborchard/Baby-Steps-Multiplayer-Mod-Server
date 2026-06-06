@@ -190,7 +190,13 @@ class Program
     private void OnClientDisconnected(ConnectedClient client)
     {
         _easterEggActive.Remove(client.Uuid);
-        _ = _discord.SendPlayerLeftAsync(client.DisplayName ?? "Unknown", client.Uuid, _host.Clients.Count);
+
+        // Ignore peers that never sent PlayerInfo (e.g. the level editor connecting briefly).
+        // They were never announced as joined, so skip the webhook and count change entirely.
+        if (!client.IsInitialized) return;
+
+        int realCount = _host.Clients.Values.Count(c => c.IsInitialized);
+        _ = _discord.SendPlayerLeftAsync(client.DisplayName!, client.Uuid, realCount);
     }
 
     // --- Packet handlers ---
@@ -237,7 +243,8 @@ class Program
         {
             Console.WriteLine($"Player {name}[{sender.Uuid}] has connected.");
             sender.DisplayName = name;
-            _ = _discord.SendPlayerJoinedAsync(name, sender.Uuid, host.Clients.Count);
+            int realCount = host.Clients.Values.Count(c => c.IsInitialized);
+            _ = _discord.SendPlayerJoinedAsync(name, sender.Uuid, realCount);
         }
         else if (sender.DisplayName != name)
         {
