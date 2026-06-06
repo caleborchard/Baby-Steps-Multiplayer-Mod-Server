@@ -3,11 +3,11 @@ name: .NET
 on:
   push:
     branches: [ "main" ]
-    
+
 permissions:
   contents: read
-  packages: write
-  
+  packages: read
+
 jobs:
   build-linux:
     runs-on: ubuntu-latest
@@ -19,8 +19,12 @@ jobs:
         dotnet-version: 8.0.x
     - name: Restore dependencies
       run: dotnet restore
+      env:
+        NUGET_AUTH_TOKEN: ${{ github.token }}
     - name: Build
       run: dotnet build --no-restore
+      env:
+        NUGET_AUTH_TOKEN: ${{ github.token }}
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
@@ -37,8 +41,12 @@ jobs:
         dotnet-version: 8.0.x
     - name: Restore dependencies
       run: dotnet restore
+      env:
+        NUGET_AUTH_TOKEN: ${{ github.token }}
     - name: Build
       run: dotnet build --no-restore
+      env:
+        NUGET_AUTH_TOKEN: ${{ github.token }}
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:

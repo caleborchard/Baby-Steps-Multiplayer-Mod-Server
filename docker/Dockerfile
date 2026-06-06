@@ -1,10 +1,13 @@
 FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
 WORKDIR /src
 
-COPY ../BabyStepsMultiplayerServer/* .
-RUN dotnet restore BabyStepsMultiplayerServer.csproj
+COPY BabyStepsMultiplayerServer/ ./BabyStepsMultiplayerServer/
+COPY nuget.config ./
 
-RUN dotnet publish BabyStepsMultiplayerServer.csproj \
+ARG GITHUB_TOKEN
+RUN NUGET_AUTH_TOKEN=${GITHUB_TOKEN} dotnet restore BabyStepsMultiplayerServer/BabyStepsMultiplayerServer.csproj
+
+RUN dotnet publish BabyStepsMultiplayerServer/BabyStepsMultiplayerServer.csproj \
     -c Release \
     -o /app/publish \
     --no-restore
@@ -17,7 +20,7 @@ COPY docker/docker-entrypoint.sh /app/entrypoint.sh
 
 EXPOSE 7777
 
-LABEL org.opencontainers.image.description A headless C# server for the Baby Steps Multiplayer Mod. 
+LABEL org.opencontainers.image.description="A headless C# server for the Baby Steps Multiplayer Mod."
 
 ENV DOTNET_ENVIRONMENT=Production
 
