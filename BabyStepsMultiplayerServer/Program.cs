@@ -1,608 +1,409 @@
-﻿using BabyStepsMultiplayerServer;
-using LiteNetLib;
-using LiteNetLib.Utils;
-using System;
+using BabyStepsNetworking.Host;
+using BabyStepsNetworking.Packets;
+using BabyStepsNetworking.Shared;
+using BabyStepsNetworking.Transport;
+using BabyStepsNetworking.Transport.LiteNetLib;
+using BabyStepsMultiplayerServer;
 using System.Diagnostics;
+using System.Linq;
 using System.Net;
 using System.Net.Sockets;
-using System.Numerics;
 using System.Text;
 using System.Text.Json;
-using System.Threading.Tasks;
+using System.Threading;
 
-namespace BabyStepsServer
+namespace BabyStepsServer;
+
+class Program
 {
-    class Program : INetEventListener
+    private const string SERVER_VERSION = "108";
+    private const string GITHUB_REPO = "https://github.com/caleborchard/Baby-Steps-Multiplayer-Mod-Server";
+
+    private NetworkHost _host;
+    private DiscordWebhookHelper _discord;
+    private ServerLifecycleTracker _lifecycle;
+    private ServerSettings _serverSettings;
+    private volatile bool _isRunning = true;
+    private bool _shutdownRecorded = false;
+    private CancellationTokenSource _statusCts;
+    private readonly Dictionary<byte, bool> _easterEggActive = new();
+
+    static async Task Main(string[] args)
     {
-        // --- Constants ---
-        private const byte OPCODE_UID = 0x01;
-        private const byte OPCODE_ICC = 0x02;
-        private const byte OPCODE_DCC = 0x03;
-        private const byte OPCODE_UCI = 0x04;
-        private const byte OPCODE_UBP = 0x05;
-        private const byte OPCODE_GWE = 0x06;
-        private const byte OPCODE_AAE = 0x07;
-        private const byte OPCODE_ARE = 0x08;
-        private const byte OPCODE_JRE = 0x09;
-        private const byte OPCODE_CTE = 0x0A;
-        private const byte OPCODE_CMS = 0x0B;
-        private const byte OPCODE_PCF = 0x0C;
-
-        private const string SERVER_VERSION = "106";
-        private const string GITHUB_REPO = "https://github.com/caleborchard/Baby-Steps-Multiplayer-Mod-Server";
-
-        // --- Fields ---
-        private NetManager _server;
-        private Dictionary<NetPeer, ClientInfo> _clients = new();
-        private readonly NetDataWriter writer = new();
-        private ServerSettings _settings;
-        private BandwidthManager _bandwidthManager;
-        private DiscordWebhookHelper _discordWebhook;
-        private readonly ServerLifecycleTracker _serverLifecycleTracker;
-
-        private HashSet<byte> _usedUUIDs = new HashSet<byte>();
-        private const byte MAX_UUID = 254; // Reserve 255 for errors
-        public Dictionary<byte, ushort> _lastSeenSequencePerClient = new();
-
-        private readonly int targetFPS = 60;
-        private volatile bool _isCulling = false;
-        private readonly object _clientLock = new object();
-        private volatile bool _isRunning = true;
-        private bool _shutdownRecorded = false;
-
-        private long _uptimeMs = 0;
-
-        // --- Entry Point ---
-        static async Task Main(string[] args)
+        try
         {
-            try
-            {
-                Console.Clear();
-                Console.SetOut(new TimestampedTextWriter(Console.Out));
-                await new Program(args).Run();
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Fatal error: {ex}");
-                Console.ReadLine();
-            }
+            Console.OutputEncoding = System.Text.Encoding.UTF8;
+            Console.Clear();
+            Console.SetOut(new TimestampedTextWriter(Console.Out));
+            await new Program(args).Run();
         }
-
-        public Program(string[]? args = null)
+        catch (Exception ex)
         {
-            _settings = ServerSettings.Load(args);
-            _bandwidthManager = new BandwidthManager(_settings, targetFPS, _clients);
-            _discordWebhook = new DiscordWebhookHelper(_settings.DiscordWebhookUrl, _settings.DiscordWebhookEnabled);
-            _serverLifecycleTracker = new ServerLifecycleTracker();
-
-            Console.CancelKeyPress += OnCancelKeyPress;
-            AppDomain.CurrentDomain.ProcessExit += OnProcessExit;
-
-            _server = new NetManager(this)
-            {
-                AutoRecycle = true,
-                IPv6Enabled = false,
-                DisconnectTimeout = 15000
-            };
+            Console.WriteLine($"Fatal error: {ex}");
+            Console.ReadLine();
         }
+    }
 
-        public async Task Run()
+    public Program(string[]? args = null)
+    {
+        _serverSettings = ServerSettings.Load(args);
+
+        var hostSettings = _serverSettings.ToHostSettings(SERVER_VERSION);
+        var transport = new LiteNetLibServerTransport();
+        _host = new NetworkHost(transport, hostSettings);
+        _host.Log += Console.WriteLine;
+        _host.ClientConnected += OnClientConnected;
+        _host.ClientDisconnected += OnClientDisconnected;
+
+        RegisterHandlers();
+
+        _discord = new DiscordWebhookHelper(_serverSettings.DiscordWebhookUrl, _serverSettings.DiscordWebhookEnabled);
+        _lifecycle = new ServerLifecycleTracker();
+
+        Console.CancelKeyPress += (_, e) => { e.Cancel = true; _isRunning = false; };
+        AppDomain.CurrentDomain.ProcessExit += (_, _) => RecordCleanShutdown();
+    }
+
+    private void RegisterHandlers()
+    {
+        _host.RegisterHandler(CoreClientToServerOpcode.BoneUpdate,       HandleBoneUpdate);
+        _host.RegisterHandler(CoreClientToServerOpcode.PlayerInfo,       HandlePlayerInfo);
+        _host.RegisterHandler(CoreClientToServerOpcode.WorldEvent,       HandleWorldEvent);
+        _host.RegisterHandler(CoreClientToServerOpcode.AccessoryAdd,     HandleAccessoryAdd);
+        _host.RegisterHandler(CoreClientToServerOpcode.AccessoryRemove,  HandleAccessoryRemove);
+        _host.RegisterHandler(CoreClientToServerOpcode.JiminyRibbon,     HandleJiminyUpdate);
+        _host.RegisterHandler(CoreClientToServerOpcode.CollisionToggle,  HandleCollisionToggle);
+        _host.RegisterHandler(CoreClientToServerOpcode.ChatMessage,      HandleChatMessage);
+        _host.RegisterHandler(CoreClientToServerOpcode.AudioFrame,       HandleAudioFrame);
+    }
+
+    public async Task Run()
+    {
+        CheckForUpdates();
+
+        var startup = _lifecycle.MarkServerStarted();
+        _ = _discord.SendServerStartedAsync(startup.Downtime, startup.PreviousRunLikelyCrashed);
+
+        _host.Start();
+        StartStatusListener();
+
+        var pw = _serverSettings.Password;
+        Console.WriteLine($"Bandwidth: {_serverSettings.MaxBandwidthKbps} KB/s | Telemetry: {(_serverSettings.TelemetryEnabled ? "ON" : "OFF")}");
+        Console.WriteLine($"Discord Webhook: {(_serverSettings.DiscordWebhookEnabled ? "ON" : "OFF")}");
+
+        var frameSw = Stopwatch.StartNew();
+        long lastHeartbeatMs = 0;
+        const int targetFps = 60;
+
+        try
         {
-            CheckForUpdates();
-
-            var startupInfo = _serverLifecycleTracker.MarkServerStarted();
-            _ = _discordWebhook.SendServerStartedAsync(startupInfo.Downtime, startupInfo.PreviousRunLikelyCrashed);
-
-            _server.Start(_settings.Port);
-            Console.WriteLine($"Server started on UDP port {_settings.Port} " +
-                (_settings.Password == "cuzzillobochfoddy" ? "with no password" : $"with password {_settings.Password}")
-            );
-            Console.WriteLine($"Bandwidth limit: {_settings.MaxBandwidthKbps} KB/s | Telemetry: {(_settings.TelemetryEnabled ? "ON" : "OFF")}");
-            Console.WriteLine($"Discord Webhook: {(_settings.DiscordWebhookEnabled ? "ON" : "OFF")}");
-
-            Stopwatch frameSw = new Stopwatch();
-            Stopwatch uptimeSw = new Stopwatch();
-            frameSw.Start();
-            uptimeSw.Start();
-            long lastHeartbeatAtMs = 0;
-            int timeSinceLastBoneVectorUpdate = 0;
-            _uptimeMs = 0;
-
-            try
+            while (_isRunning)
             {
-                while (_isRunning)
+                float deltaMs = (float)frameSw.Elapsed.TotalMilliseconds;
+                frameSw.Restart();
+
+                _host.Tick(deltaMs);
+
+                if (_host.UptimeMs - lastHeartbeatMs >= 5000)
                 {
-                    _server.PollEvents();
-                    _bandwidthManager.ProcessQueues();
-
-                    frameSw.Stop();
-                    timeSinceLastBoneVectorUpdate += (int)frameSw.ElapsedMilliseconds;
-
-                    _uptimeMs = uptimeSw.ElapsedMilliseconds;
-
-                    if (_uptimeMs - lastHeartbeatAtMs >= 5000)
-                    {
-                        _serverLifecycleTracker.UpdateHeartbeat();
-                        lastHeartbeatAtMs = _uptimeMs;
-                    }
-
-                    if (timeSinceLastBoneVectorUpdate >= _settings.StaticUpdateRate && !_isCulling)
-                    {
-                        timeSinceLastBoneVectorUpdate = 0;
-                        _isCulling = true;
-
-                        // Unlikely to cause errors which is why I'm fine not awaiting this to keep things running smoothly
-                        Task.Run(() => CullDistantClients());
-                    }
-
-                    frameSw.Restart();
-                    await Task.Delay(1000 / targetFPS);
+                    _lifecycle.UpdateHeartbeat();
+                    lastHeartbeatMs = _host.UptimeMs;
                 }
-            }
-            finally
-            {
-                RecordCleanShutdown();
-                _server.Stop();
+
+                await Task.Delay(1000 / targetFps);
             }
         }
-
-        private void OnCancelKeyPress(object? sender, ConsoleCancelEventArgs e)
-        {
-            e.Cancel = true;
-            _isRunning = false;
-        }
-
-        private void OnProcessExit(object? sender, EventArgs e)
+        finally
         {
             RecordCleanShutdown();
+            _host.Stop();
         }
+    }
 
-        private void RecordCleanShutdown()
-        {
-            if (_shutdownRecorded)
-                return;
+    private void RecordCleanShutdown()
+    {
+        if (_shutdownRecorded) return;
+        _shutdownRecorded = true;
+        _statusCts?.Cancel();
+        _lifecycle.MarkCleanShutdown();
+    }
 
-            _shutdownRecorded = true;
-            _serverLifecycleTracker.MarkCleanShutdown();
-        }
+    private void StartStatusListener()
+    {
+        int statusPort = _serverSettings.Port + 1;
+        _statusCts = new CancellationTokenSource();
+        var token   = _statusCts.Token;
 
-        private void CheckForUpdates()
+        bool isLocked = !string.IsNullOrEmpty(_serverSettings.Password)
+                     && _serverSettings.Password != "cuzzillobochfoddy";
+
+        Task.Run(() =>
         {
             try
             {
-                using (var client = new HttpClient())
+                using var udp = new UdpClient(statusPort);
+                udp.Client.ReceiveTimeout = 500;
+                Console.WriteLine($"Status listener on port {statusPort}");
+
+                while (!token.IsCancellationRequested)
                 {
-                    client.DefaultRequestHeaders.Add("User-Agent", "BabyStepsServer");
-                    client.Timeout = TimeSpan.FromSeconds(5);
-
-                    var response = client.GetAsync("https://api.github.com/repos/caleborchard/Baby-Steps-Multiplayer-Mod-Server/releases/latest").Result;
-
-                    if (response.IsSuccessStatusCode)
+                    try
                     {
-                        var json = response.Content.ReadAsStringAsync().Result;
-                        var doc = JsonDocument.Parse(json);
-                        var latestTag = doc.RootElement.GetProperty("tag_name").GetString();
+                        var ep   = new IPEndPoint(IPAddress.Any, 0);
+                        var data = udp.Receive(ref ep);
 
-                        if (latestTag != null)
+                        if (data.Length >= 4
+                            && data[0] == 'B' && data[1] == 'B'
+                            && data[2] == 'S' && data[3] == 'Q')
                         {
-                            // Remove 'v' prefix if present
-                            latestTag = latestTag.TrimStart('v');
+                            // Only count players who have fully introduced themselves
+                            int count = _host?.Clients.Values
+                                .Count(c => c.InfoPacket != null) ?? 0;
 
-                            // Convert version strings to comparable format (remove dots)
-                            string currentVersion = SERVER_VERSION;
-                            string latestVersion = latestTag.Replace(".", "");
-
-                            // Parse versions as integers for proper comparison
-                            if (int.TryParse(currentVersion, out int currentVer) && int.TryParse(latestVersion, out int latestVer))
+                            var resp = new byte[]
                             {
-                                if (currentVer < latestVer)
-                                {
-                                    Console.WriteLine("╔════════════════════════════════════════════════════════════════╗");
-                                    Console.WriteLine("║                     VERSION WARNING                            ║");
-                                    Console.WriteLine("╠════════════════════════════════════════════════════════════════╣");
-                                    Console.WriteLine($"║  Your server version: {currentVersion.PadRight(40)} ║");
-                                    Console.WriteLine($"║  Latest version:      {latestVersion.PadRight(40)} ║");
-                                    Console.WriteLine("║                                                                ║");
-                                    Console.WriteLine("║  Your server is OUTDATED!                                      ║");
-                                    Console.WriteLine("║  Please update to the latest version.                          ║");
-                                    Console.WriteLine("║                                                                ║");
-                                    Console.WriteLine("║  Download: github.com/caleborchard/                            ║");
-                                    Console.WriteLine("║            Baby-Steps-Multiplayer-Mod-Server                   ║");
-                                    Console.WriteLine("╚════════════════════════════════════════════════════════════════╝");
-                                    Console.WriteLine();
-                                }
-                                else if (currentVer > latestVer)
-                                {
-                                    Console.WriteLine($"Server version ({currentVersion}) is newer than latest release ({latestVersion}) - development build");
-                                }
-                                else
-                                {
-                                    Console.WriteLine($"Server is up to date (version {currentVersion})");
-                                }
-                            }
+                                (byte)'B', (byte)'B', (byte)'S', (byte)'R',
+                                (byte)Math.Clamp(count, 0, 255),
+                                16,
+                                (byte)(isLocked ? 1 : 0)
+                            };
+                            udp.Send(resp, resp.Length, ep);
                         }
                     }
+                    catch (SocketException) { /* receive timeout — loop again */ }
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Unable to check for updates: {ex.Message}");
+                Console.WriteLine($"Status listener error: {ex.Message}");
             }
+        }, token);
+    }
+
+    // --- Client lifecycle ---
+
+    private void OnClientConnected(ConnectedClient client)
+    {
+        // Nothing extra on connect; display name arrives with PlayerInfo packet
+    }
+
+    private void OnClientDisconnected(ConnectedClient client)
+    {
+        _easterEggActive.Remove(client.Uuid);
+        _ = _discord.SendPlayerLeftAsync(client.DisplayName ?? "Unknown", client.Uuid, _host.Clients.Count);
+    }
+
+    // --- Packet handlers ---
+
+    private void HandleBoneUpdate(ConnectedClient sender, byte[] data, NetworkHost host)
+    {
+        // data (opcode already stripped): [kickoff][seq_lo][seq_hi][raw_bone_data...]
+        if (!sender.IsInitialized) return;
+        if (data.Length < 4) return;
+
+        byte kickoff = data[0];
+        ushort seq = BitConverter.ToUInt16(data, 1);
+        byte[] rawBone = data[3..];
+
+        if (!host.IsNewerSequence(sender.Uuid, seq)) return;
+
+        sender.LastBoneKickoffPoint = kickoff;
+        sender.LatestRawBoneData = rawBone;
+
+        var packet = PacketBuilder.Build(CoreServerToClientOpcode.BoneUpdate, bytes =>
+        {
+            bytes.Add(sender.Uuid);
+            bytes.Add(kickoff);
+            bytes.AddRange(BitConverter.GetBytes(seq));
+            bytes.AddRange(rawBone);
+            bytes.AddRange(BitConverter.GetBytes(host.UptimeMs));
+        });
+
+        host.EnqueueBoneUpdate(sender.PeerId, packet);
+    }
+
+    private void HandlePlayerInfo(ConnectedClient sender, byte[] data, NetworkHost host)
+    {
+        // data (opcode already stripped): [R][G][B][egg_flag][name_utf8...]   name may be empty
+        if (data.Length < 4) return;
+
+        bool firstReceive = !sender.IsInitialized;
+        sender.Color = new RGBColor(data[0], data[1], data[2]);
+        _easterEggActive[sender.Uuid] = data[3] != 0;
+        int nameLen = data.Length - 4;
+        string name = nameLen > 0 ? Encoding.UTF8.GetString(data, 4, nameLen) : string.Empty;
+
+        if (sender.DisplayName == null)
+        {
+            Console.WriteLine($"Player {name}[{sender.Uuid}] has connected.");
+            sender.DisplayName = name;
+            _ = _discord.SendPlayerJoinedAsync(name, sender.Uuid, host.Clients.Count);
+        }
+        else if (sender.DisplayName != name)
+        {
+            Console.WriteLine($"{sender.DisplayName}[{sender.Uuid}] -> {name}");
+            _ = _discord.SendPlayerNameChangedAsync(sender.DisplayName, name, sender.Uuid);
+            sender.DisplayName = name;
         }
 
-        // --- Network Event Handlers ---
-        public void OnPeerConnected(NetPeer peer)
+        Console.WriteLine($"{sender.DisplayName}[{sender.Uuid}] color={sender.Color.Value.GetString()}");
+
+        // Build and cache the S2C info packet so new joiners receive it
+        var infoPacket = PacketBuilder.Build(CoreServerToClientOpcode.PlayerInfoUpdate, bytes =>
         {
-            byte uuid = AllocateUUID();
+            bytes.Add(sender.Uuid);
+            bytes.Add(sender.Color.Value.R);
+            bytes.Add(sender.Color.Value.G);
+            bytes.Add(sender.Color.Value.B);
+            bytes.Add((byte)(_easterEggActive.TryGetValue(sender.Uuid, out bool egg) && egg ? 1 : 0));
+            bytes.AddRange(Encoding.UTF8.GetBytes(sender.DisplayName!));
+        });
+        sender.InfoPacket = infoPacket;
 
-            if (uuid == 255)
+        if (firstReceive)
+        {
+            // Notify existing clients that this player has joined
+            host.Broadcast(
+                PacketBuilder.Build(CoreServerToClientOpcode.PlayerJoined, new[] { sender.Uuid }),
+                PacketDelivery.ReliableOrdered, sender.PeerId);
+        }
+
+        host.Broadcast(infoPacket, PacketDelivery.ReliableOrdered, sender.PeerId);
+    }
+
+    private void HandleWorldEvent(ConnectedClient sender, byte[] data, NetworkHost host)
+    {
+        if (data.Length < 2) return;
+        ushort seq = BitConverter.ToUInt16(data, 0);
+        if (!host.IsNewerSequence(sender.Uuid, seq)) return;
+
+        var packet = PacketBuilder.Build(CoreServerToClientOpcode.WorldEvent, bytes =>
+        {
+            bytes.Add(sender.Uuid);
+            bytes.AddRange(data);
+        });
+        host.EnqueueHighPriority(sender.PeerId, packet);
+    }
+
+    private void HandleAccessoryAdd(ConnectedClient sender, byte[] data, NetworkHost host)
+    {
+        if (data.Length < 1) return;
+        byte accessoryType = data[0];
+
+        var packet = PacketBuilder.Build(CoreServerToClientOpcode.AccessoryAdd, bytes =>
+        {
+            bytes.Add(sender.Uuid);
+            bytes.AddRange(data);
+        });
+
+        sender.SavedPackets[accessoryType] = packet;
+        host.Broadcast(packet, PacketDelivery.ReliableOrdered, sender.PeerId);
+    }
+
+    private void HandleAccessoryRemove(ConnectedClient sender, byte[] data, NetworkHost host)
+    {
+        if (data.Length < 1) return;
+        byte accessoryType = data[0];
+
+        var packet = PacketBuilder.Build(CoreServerToClientOpcode.AccessoryRemove, bytes =>
+        {
+            bytes.Add(sender.Uuid);
+            bytes.AddRange(data);
+        });
+
+        sender.SavedPackets[accessoryType] = null;
+        host.Broadcast(packet, PacketDelivery.ReliableOrdered, sender.PeerId);
+    }
+
+    private void HandleJiminyUpdate(ConnectedClient sender, byte[] data, NetworkHost host)
+    {
+        // data (opcode already stripped): [bool_state]
+        if (data.Length < 1) return;
+        sender.JiminyState = data[0] != 0;
+
+        var packet = new byte[] {
+            (byte)CoreServerToClientOpcode.JiminyRibbon,
+            sender.Uuid,
+            Convert.ToByte(sender.JiminyState)
+        };
+
+        sender.SavedPackets[0x02] = packet;
+        host.Broadcast(packet, PacketDelivery.ReliableOrdered, sender.PeerId);
+    }
+
+    private void HandleCollisionToggle(ConnectedClient sender, byte[] data, NetworkHost host)
+    {
+        if (data.Length < 1) return;
+        sender.CollisionsEnabled = data[0] != 0;
+
+        var packet = new byte[] {
+            (byte)CoreServerToClientOpcode.CollisionToggle,
+            sender.Uuid,
+            Convert.ToByte(sender.CollisionsEnabled)
+        };
+
+        sender.SavedPackets[0x03] = packet;
+        host.Broadcast(packet, PacketDelivery.ReliableOrdered, sender.PeerId);
+    }
+
+    private void HandleChatMessage(ConnectedClient sender, byte[] data, NetworkHost host)
+    {
+        if (data.Length < 1) return;
+        string message = Encoding.UTF8.GetString(data, 0, data.Length);
+        Console.WriteLine($"{sender.DisplayName}[{sender.Uuid}]: {message}");
+
+        var packet = PacketBuilder.Build(CoreServerToClientOpcode.ChatMessage, bytes =>
+        {
+            bytes.Add(sender.Uuid);
+            bytes.AddRange(data);
+        });
+        host.Broadcast(packet, PacketDelivery.ReliableOrdered, sender.PeerId);
+    }
+
+    private void HandleAudioFrame(ConnectedClient sender, byte[] data, NetworkHost host)
+    {
+        if (!_serverSettings.VoiceChatEnabled) return;
+
+        var packet = PacketBuilder.Build(CoreServerToClientOpcode.AudioFrame, bytes =>
+        {
+            bytes.Add(sender.Uuid);
+            bytes.AddRange(data);
+        });
+        host.EnqueueAudio(sender.PeerId, packet);
+    }
+
+    // --- Update check ---
+
+    private void CheckForUpdates()
+    {
+        try
+        {
+            using var client = new HttpClient();
+            client.DefaultRequestHeaders.Add("User-Agent", "BabyStepsServer");
+            client.Timeout = TimeSpan.FromSeconds(5);
+
+            var resp = client.GetAsync("https://api.github.com/repos/caleborchard/Baby-Steps-Multiplayer-Mod-Server/releases/latest").Result;
+            if (!resp.IsSuccessStatusCode) return;
+
+            var doc = JsonDocument.Parse(resp.Content.ReadAsStringAsync().Result);
+            var tag = doc.RootElement.GetProperty("tag_name").GetString()?.TrimStart('v').Replace(".", "");
+
+            if (tag != null && int.TryParse(SERVER_VERSION, out int cur) && int.TryParse(tag, out int latest))
             {
-                Console.WriteLine("Client rejected: server full");
-                peer.Disconnect();
-                return;
-            }
-
-            var info = new ClientInfo { _peer = peer, _uuid = uuid };
-            _clients[peer] = info;
-
-            List<byte> bytes = new List<byte>() { OPCODE_UID, uuid };
-            bytes.AddRange(BitConverter.GetBytes(_uptimeMs));
-
-            Send(peer, bytes.ToArray(), DeliveryMethod.ReliableOrdered);
-
-            foreach (var client in _clients)
-            {
-                if (client.Key == peer) continue;
-
-                Send(peer, new byte[] { OPCODE_ICC, client.Value._uuid }, DeliveryMethod.ReliableOrdered);
-
-                var infoPacket = GetClientInfoPacket(client.Key);
-                if (infoPacket != null) Send(peer, infoPacket, DeliveryMethod.ReliableOrdered);
-
-                foreach (var savedPacket in client.Value._savedPackets)
+                if (cur < latest)
                 {
-                    if (savedPacket.Value != null)
-                    {
-                        Send(peer, savedPacket.Value, DeliveryMethod.ReliableOrdered);
-                    }
-                }
-            }
-        }
-
-        public void OnPeerDisconnected(NetPeer peer, DisconnectInfo disconnectInfo)
-        {
-            if (_clients.TryGetValue(peer, out var client))
-            {
-                byte uuid = client._uuid;
-                Console.WriteLine($"Player {client._displayName}[{uuid}] disconnected: {disconnectInfo.Reason}");
-
-                Broadcast(new byte[] { OPCODE_DCC, uuid }, DeliveryMethod.ReliableOrdered, exclude: peer);
-
-                _clients.Remove(peer);
-                _lastSeenSequencePerClient.Remove(uuid);
-                ReclaimUUID(uuid);
-
-                // Send Discord notification
-                _ = _discordWebhook.SendPlayerLeftAsync(client._displayName ?? "Unknown", uuid, _clients.Count);
-            }
-        }
-
-        public void OnNetworkReceive(NetPeer peer, NetPacketReader reader, byte channelNum, DeliveryMethod deliveryMethod)
-        {
-            byte[] fullData = reader.GetRemainingBytes();
-            reader.Recycle();
-
-            if (fullData.Length < 2)
-            {
-                Console.WriteLine("Received packet too short to contain length header.");
-                return;
-            }
-
-            ushort declaredLength = BitConverter.ToUInt16(fullData, 0);
-            if (declaredLength != fullData.Length)
-            {
-                Console.WriteLine($"Packet length mismatch: expected {declaredLength}, got {fullData.Length}");
-                return;
-            }
-
-            byte[] data = new byte[fullData.Length - 2];
-            Buffer.BlockCopy(fullData, 2, data, 0, data.Length);
-
-            if (!_clients.TryGetValue(peer, out var client)) return;
-
-            byte opcode = data[0];
-            HandleOpcode(peer, client, opcode, data);
-        }
-
-        public void OnConnectionRequest(ConnectionRequest request)
-        {
-            string incomingKey = request.Data.GetString();
-
-            string assembledPassword = SERVER_VERSION + _settings.Password;
-            if (incomingKey == assembledPassword) request.Accept();
-            else
-            {
-                request.Reject();
-                if (incomingKey.StartsWith(SERVER_VERSION))
-                {
-                    Console.WriteLine($"Client tried to connect with incorrect password: {incomingKey.Substring(SERVER_VERSION.Length)}");
+                    Console.WriteLine("╔══════════════════════════════════════╗");
+                    Console.WriteLine($"║  Server OUTDATED: {SERVER_VERSION} → {tag}        ║");
+                    Console.WriteLine($"║  {GITHUB_REPO.Substring(8)}  ║");
+                    Console.WriteLine("╚══════════════════════════════════════╝");
                 }
                 else
-                {
-                    Console.WriteLine($"Outdated client has attempted a connection and been rejected.");
-                }
+                    Console.WriteLine($"Server is up to date (v{SERVER_VERSION})");
             }
         }
-
-        public void OnNetworkReceiveUnconnected(IPEndPoint endPoint, NetPacketReader reader, UnconnectedMessageType messageType) { }
-        public void OnNetworkError(IPEndPoint endPoint, SocketError socketError)
+        catch (Exception ex)
         {
-            Console.WriteLine($"Socket error: {socketError}");
-        }
-        public void OnNetworkLatencyUpdate(NetPeer peer, int latency) { }
-
-        // --- Helper Methods ---
-        private void CullDistantClients()
-        {
-            lock (_clientLock)
-            {
-                foreach (var kvp in _clients)
-                {
-                    var client = kvp.Value;
-                    var data = client._latestRawBonePacket;
-
-                    if (data != null && data.Length >= 29)
-                    {
-                        float posZ = BitConverter.ToSingle(data, 8);
-                        client.position = new Vector3(0, 0, posZ);
-                    }
-                }
-
-                foreach (var kvpA in _clients)
-                {
-                    var clientA = kvpA.Value;
-                    clientA.distantClients = new List<NetPeer>();
-
-                    foreach (var kvpB in _clients)
-                    {
-                        if (kvpA.Key == kvpB.Key) continue;
-                        float distance = Math.Abs(clientA.position.Z - kvpB.Value.position.Z);
-                        if (distance > _settings.DistanceCutoff)
-                            clientA.distantClients.Add(kvpB.Key);
-                    }
-                }
-            }
-            _isCulling = false;
-        }
-
-        private void HandleOpcode(NetPeer peer, ClientInfo client, byte opcode, byte[] data)
-        {
-            switch (opcode)
-            {
-                case 1: HandleBoneInfo(peer, client, data); break;
-                case 2: HandleClientInfo(peer, client, data); break;
-                case 3: HandleWorldEvent(peer, client, data); break;
-                case 4: HandleAccessoryAdd(peer, client, data); break;
-                case 5: HandleAccessoryRemove(peer, client, data); break;
-                case 6: HandleJiminyUpdate(peer, client, data); break;
-                case 7: HandleCollisionToggleUpdate(peer, client, data); break;
-                case 8: HandleChatMessage(peer, client, data); break;
-                case 9: HandleAudioFrame(peer, client, data); break;
-                default: Console.WriteLine($"{client._uuid}: Unknown opcode {opcode}"); break;
-            }
-        }
-
-        private void HandleBoneInfo(NetPeer peer, ClientInfo client, byte[] data)
-        {
-            if (client._color == null || client._displayName == null) return;
-            byte senderKickoff = data[1];
-            ushort seq = BitConverter.ToUInt16(data, 2);
-            byte[] rawTransformData = data[4..];
-
-            if (!_lastSeenSequencePerClient.TryGetValue(client._uuid, out ushort lastSeq) || IsNewer(seq, lastSeq))
-            {
-                _lastSeenSequencePerClient[client._uuid] = seq;
-                client._lbKickoffPoint = senderKickoff;
-                client._latestRawBonePacket = rawTransformData;
-
-                List<byte> packet = new() { OPCODE_UBP, client._uuid, client._lbKickoffPoint };
-                packet.AddRange(BitConverter.GetBytes(seq));
-                packet.AddRange(rawTransformData);
-                packet.AddRange(BitConverter.GetBytes(_uptimeMs)); //long, 8 bytes
-
-                _bandwidthManager.EnqueueBoneUpdate(peer, packet.ToArray());
-            }
-        }
-
-        private void HandleClientInfo(NetPeer peer, ClientInfo client, byte[] data)
-        {
-            var firstReceive = false;
-            if (client._color == null || client._displayName == null) firstReceive = true;
-
-            client._color = new RGBColor(data[1], data[2], data[3]);
-
-            string receivedName = Encoding.UTF8.GetString(data, 4, data.Length - 4);
-
-            if (client._displayName == null)
-            {
-                Console.WriteLine($"Player {receivedName}[{client._uuid}] has connected.");
-                client._displayName = receivedName;
-
-                // Send Discord notification for join
-                _ = _discordWebhook.SendPlayerJoinedAsync(receivedName, client._uuid, _clients.Count);
-            }
-            else if (client._displayName != receivedName)
-            {
-                Console.WriteLine($"{client._displayName}[{client._uuid}] changed nickname to {receivedName}");
-
-                // Send Discord notification for name change
-                _ = _discordWebhook.SendPlayerNameChangedAsync(client._displayName, receivedName, client._uuid);
-
-                client._displayName = receivedName;
-            }
-
-            Console.WriteLine($"{client._displayName}[{client._uuid}] set color to {client._color.GetString()}");
-
-            if (firstReceive) Broadcast(new byte[] { OPCODE_ICC, client._uuid }, DeliveryMethod.ReliableOrdered, exclude: peer);
-            Broadcast(GetClientInfoPacket(peer), DeliveryMethod.ReliableOrdered, exclude: peer);
-        }
-
-        private void HandleWorldEvent(NetPeer peer, ClientInfo client, byte[] data)
-        {
-            ushort seq = BitConverter.ToUInt16(data, 1);
-            byte[] rawGWEData = data[3..];
-
-            if (!_lastSeenSequencePerClient.TryGetValue(client._uuid, out ushort lastSeq) || IsNewer(seq, lastSeq))
-            {
-                _lastSeenSequencePerClient[client._uuid] = seq;
-                List<byte> packet = new() { OPCODE_GWE, client._uuid };
-                packet.AddRange(BitConverter.GetBytes(seq));
-                packet.AddRange(rawGWEData);
-
-                _bandwidthManager.EnqueueHighPriority(peer, packet.ToArray());
-            }
-        }
-
-        private void HandleAccessoryAdd(NetPeer peer, ClientInfo client, byte[] data)
-        {
-            List<byte> packet = new() { OPCODE_AAE, client._uuid };
-            packet.AddRange(data[1..]);
-            var packetArray = packet.ToArray();
-
-            client._savedPackets[data[1]] = packetArray;
-
-            Broadcast(packetArray, DeliveryMethod.ReliableOrdered, exclude: peer);
-        }
-
-        private void HandleAccessoryRemove(NetPeer peer, ClientInfo client, byte[] data)
-        {
-            List<byte> packet = new() { OPCODE_ARE, client._uuid };
-            packet.AddRange(data[1..]);
-
-            client._savedPackets[data[1]] = null;
-
-            Broadcast(packet.ToArray(), DeliveryMethod.ReliableOrdered, exclude: peer);
-        }
-
-        private void HandleJiminyUpdate(NetPeer peer, ClientInfo client, byte[] data)
-        {
-            client.jiminyState = Convert.ToBoolean(data[1]);
-
-            byte[] packet = { OPCODE_JRE, client._uuid, Convert.ToByte(client.jiminyState) };
-
-            client._savedPackets[0x02] = packet;
-
-            Broadcast(packet, DeliveryMethod.ReliableOrdered, exclude: peer);
-        }
-
-        private void HandleCollisionToggleUpdate(NetPeer peer, ClientInfo client, byte[] data)
-        {
-            client.collisionsEnabled = Convert.ToBoolean(data[1]);
-
-            byte[] packet = { OPCODE_CTE, client._uuid, Convert.ToByte(client.collisionsEnabled) };
-
-            client._savedPackets[0x03] = packet;
-
-            Broadcast(packet, DeliveryMethod.ReliableOrdered, exclude: peer);
-        }
-
-        private void HandleChatMessage(NetPeer peer, ClientInfo client, byte[] data)
-        {
-            List<byte> packet = new();
-            packet.Add(OPCODE_CMS);
-            packet.Add(client._uuid);
-
-            byte[] dataToSend = data.Skip(1).ToArray();
-            packet.AddRange(dataToSend);
-
-            Console.WriteLine($"{client._displayName}[{client._uuid}]: {Encoding.UTF8.GetString(dataToSend)}");
-
-            Broadcast(packet.ToArray(), DeliveryMethod.ReliableOrdered, exclude: peer);
-        }
-
-        private void HandleAudioFrame(NetPeer peer, ClientInfo client, byte[] data)
-        {
-            if (!_settings.VoiceChatEnabled) return;
-
-            List<byte> packet = new();
-            packet.Add(OPCODE_PCF);
-            packet.Add(client._uuid);
-
-            packet.AddRange(data[1..]);
-
-            _bandwidthManager.EnqueueAudioFrame(peer, packet.ToArray());
-        }
-
-        // --- UUID Management ---
-        private byte AllocateUUID()
-        {
-            for (byte i = 0; i <= MAX_UUID; i++)
-            {
-                if (!_usedUUIDs.Contains(i))
-                {
-                    _usedUUIDs.Add(i);
-                    return i;
-                }
-            }
-
-            Console.WriteLine("Maximum number of clients reached!");
-            return 255;
-        }
-
-        private void ReclaimUUID(byte uuid)
-        {
-            _usedUUIDs.Remove(uuid);
-        }
-
-        // --- Utilities ---
-        static bool IsNewer(ushort current, ushort previous)
-        {
-            return (ushort)(current - previous) < 32768;
-        }
-
-        private byte[] GetClientInfoPacket(NetPeer peer)
-        {
-            ClientInfo info = _clients[peer];
-            if (info._color == null || string.IsNullOrEmpty(info._displayName))
-            {
-                Console.WriteLine($"Warning: Missing client info for UUID {info._uuid}");
-                return new byte[0];
-            }
-
-            List<byte> final = new()
-            {
-                OPCODE_UCI,
-                info._uuid,
-                info._color.R,
-                info._color.G,
-                info._color.B
-            };
-
-            final.AddRange(Encoding.UTF8.GetBytes(info._displayName));
-            return final.ToArray();
-        }
-
-        private void Send(NetPeer peer, byte[] packet, DeliveryMethod deliveryMethod)
-        {
-            writer.Reset();
-            ushort totalLength = (ushort)(packet.Length + 2);
-            writer.Put(totalLength);
-            writer.Put(packet);
-            peer.Send(writer, deliveryMethod);
-        }
-
-        private void Broadcast(byte[] packet, DeliveryMethod deliveryMethod, NetPeer? exclude)
-        {
-            writer.Reset();
-            ushort totalLength = (ushort)(packet.Length + 2);
-            writer.Put(totalLength);
-            writer.Put(packet);
-
-            foreach (var client in _clients)
-            {
-                if (client.Key == exclude) continue;
-                client.Key.Send(writer, deliveryMethod);
-            }
+            Console.WriteLine($"Unable to check for updates: {ex.Message}");
         }
     }
 }
